@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>修了个仙后台</title>
+  <!-- 请勿在项目正式环境中引用该 layui.css 地址 -->
+  <link rel="stylesheet" href="/static/layui/css/layui.css">
+</head>
+<body>
+<div class="layui-layout layui-layout-admin">
+  <div class="layui-header">
+    <div class="layui-logo layui-hide-xs layui-bg-black">后台管理</div>
+    <!-- 头部区域（可配合layui 已有的水平导航） -->
+    <ul class="layui-nav layui-layout-left">
+      <!-- 移动端显示 -->
+      <li class="layui-nav-item layui-show-xs-inline-block layui-hide-sm" lay-header-event="menuLeft">
+        <i class="layui-icon layui-icon-spread-left"></i>
+      </li>
+      <li class="layui-nav-item layui-hide-xs"><a href="javascript:;">账号权限</a></li>
+      <li class="layui-nav-item layui-hide-xs"><a href="javascript:;">nav 2</a></li>
+      <li class="layui-nav-item layui-hide-xs"><a href="javascript:;">nav 3</a></li>
+      <li class="layui-nav-item">
+        <a href="javascript:;">nav groups</a>
+        <dl class="layui-nav-child">
+          <dd><a href="javascript:;">menu 11</a></dd>
+          <dd><a href="javascript:;">menu 22</a></dd>
+          <dd><a href="javascript:;">menu 33</a></dd>
+        </dl>
+      </li>
+    </ul>
+    <ul class="layui-nav layui-layout-right">
+      <li class="layui-nav-item layui-hide layui-show-sm-inline-block">
+        <a href="javascript:;">
+          <img src="//unpkg.com/outeres@0.0.10/img/layui/icon-v2.png" class="layui-nav-img">
+          tester
+        </a>
+        <dl class="layui-nav-child">
+          <dd><a href="javascript:;">Your Profile</a></dd>
+          <dd><a href="javascript:;">Settings</a></dd>
+          <dd><a href="javascript:;">Sign out</a></dd>
+        </dl>
+      </li>
+      <li class="layui-nav-item" lay-header-event="menuRight" lay-unselect>
+        <a href="javascript:;">
+          <i class="layui-icon layui-icon-more-vertical"></i>
+        </a>
+      </li>
+    </ul>
+  </div>
+  <div class="layui-side layui-bg-black">
+    <div class="layui-side-scroll">
+      <!-- 左侧导航区域（可配合layui已有的垂直导航） -->
+      <ul class="layui-nav layui-nav-tree" lay-filter="test">
+        <li class="layui-nav-item">
+          <a class="" href="javascript:;">数据分析</a>
+          <dl class="layui-nav-child">
+            <dd><a href="/static/数据分析/实时数据/实时数据.html">实时数据</a></dd>
+            <dd><a href="/static/数据分析/营收数据/营收数据.html">营收数据</a></dd>
+            <dd><a href="/static/数据分析/运营报表/运营报表.html">运营报表</a></dd>
+            <dd><a href="/static/数据分析/玩家分析/玩家分析.html">玩家分析</a></dd>
+            <dd><a href="/static/数据分析/充值分析/充值分析.html">充值分析</a></dd>
+          </dl>
+        </li>
+        <li class="layui-nav-item layui-nav-itemed">
+          <a href="javascript:;">运营管理</a>
+          <dl class="layui-nav-child">
+            <dd class="layui-this"><a href="/static/运营管理/玩家管理/玩家管理.html">玩家管理</a></dd>
+            <dd><a href="/static/运营管理/资源管理/资源管理.html">资源管理</a></dd>
+            <dd><a href="/static/运营管理/公告管理/公告管理.html">公告管理</a></dd>
+            <dd><a href="/static/运营管理/邮件管理/邮件管理.html">邮件管理</a></dd>
+            <dd><a href="/static/运营管理/运营管理/运营管理.html">运营管理</a></dd>
+          </dl>
+        </li>
+        <li class="layui-nav-item"><a href="javascript:;">排行数据</a></li>
+        <li class="layui-nav-item"><a href="javascript:;">系统管理</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="layui-body">
+    <!-- 内容主体区域 -->
+    <iframe src="/static/运营管理/玩家管理/玩家信息.html" height=855px width=1708px id="main"></iframe>
+  </div>
+</div>
+
+<script src="/static/layui/layui.js"></script>
+<script>
+    layui.use(function (){
+        var element = layui.element;
+        var $ = layui.jquery;
+        $(document).ready(function(){
+            $("dd>a").on('click', function (e){
+                e.preventDefault();
+                $('#main').attr("src",$(this).attr("href"));
+            });
+        });
+        });
+</script>
+</body>
+</html>
