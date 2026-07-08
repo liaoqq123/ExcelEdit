@@ -1,0 +1,29 @@
+{
+  "folder_path": "D:/xy/data/dev",
+  "keyword": "开服庆典",
+  "reference_config": {
+    "sample_text": "FOREIGN:BBB.Id",
+    "reference_row_index": 6,
+    "table_name": "BBB",
+    "field_name": "Id",
+    "field_row_index": 5
+  },
+  "disabled_sheet_marker": "$",
+  "data_filter_config": {
+    "enable_header_filter": true,
+    "header_row_count": 6,
+    "enable_column_filter": false,
+    "column_marker_row_index": 1,
+    "disabled_column_marker": "$",
+    "enable_disabled_row_filter": false,
+    "disabled_row_marker_column_index": 1,
+    "disabled_row_contains": "",
+    "enable_range_row_filter": true,
+    "range_row_marker_column_index": 1,
+    "range_start_text": "Start",
+    "range_end_text": "End"
+  },
+  "help_url": "",
+  "only_enabled_sheets": true,
+  "only_enabled_data": false
+}

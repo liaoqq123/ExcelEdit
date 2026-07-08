@@ -1,0 +1,23 @@
+{
+  "folder_path": "D:/xy/data/dev",
+  "keyword": "GvG_sign",
+  "reference_config": {
+    "sample_text": "FOREIGN:BBB.Id",
+    "reference_row_index": 6,
+    "table_name": "BBB",
+    "field_name": "Id",
+    "field_row_index": 1
+  },
+  "disabled_sheet_marker": "$",
+  "data_filter_config": {
+    "column_marker_row_index": 1,
+    "disabled_column_marker": "$",
+    "row_filter_mode": "无",
+    "disabled_row_contains": "",
+    "range_start_text": "",
+    "range_end_text": ""
+  },
+  "help_url": "",
+  "only_enabled_sheets": false,
+  "only_enabled_data": false
+}
