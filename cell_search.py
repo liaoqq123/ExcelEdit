@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from threading import Event
 import posixpath
 import re
 import zipfile
@@ -70,6 +71,7 @@ def search_excel_cells(
     keyword: str,
     disabled_sheet_marker: str | None = None,
     data_filter_config: DataFilterConfig | None = None,
+    cancel_event: Event | None = None,
 ) -> list[ExcelCellMatch]:
     normalized_keyword = keyword.strip().lower()
     if not normalized_keyword:
@@ -77,7 +79,17 @@ def search_excel_cells(
 
     matches: list[ExcelCellMatch] = []
     for path in iter_excel_files(folder_path):
-        matches.extend(_search_excel_file_cells(path, normalized_keyword, disabled_sheet_marker, data_filter_config))
+        if _is_cancelled(cancel_event):
+            break
+        matches.extend(
+            _search_excel_file_cells(
+                path,
+                normalized_keyword,
+                disabled_sheet_marker,
+                data_filter_config,
+                cancel_event,
+            )
+        )
 
     return matches
 
@@ -87,14 +99,15 @@ def _search_excel_file_cells(
     keyword: str,
     disabled_sheet_marker: str | None,
     data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
     suffix = path.suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        return _search_xlsx_xml_cells(path, keyword, disabled_sheet_marker, data_filter_config)
+        return _search_xlsx_xml_cells(path, keyword, disabled_sheet_marker, data_filter_config, cancel_event)
     if suffix == ".xls":
-        return _search_xlrd_cells(path, keyword, disabled_sheet_marker, data_filter_config)
+        return _search_xlrd_cells(path, keyword, disabled_sheet_marker, data_filter_config, cancel_event)
     if suffix == ".xlsb":
-        return _search_xlsb_cells(path, keyword, disabled_sheet_marker, data_filter_config)
+        return _search_xlsb_cells(path, keyword, disabled_sheet_marker, data_filter_config, cancel_event)
     return []
 
 
@@ -103,15 +116,22 @@ def _search_xlsx_xml_cells(
     keyword: str,
     disabled_sheet_marker: str | None,
     data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
     try:
         with zipfile.ZipFile(path) as archive:
-            shared_strings = _read_shared_strings(archive) if data_filter_config is not None else None
+            if _is_cancelled(cancel_event):
+                return []
+
+            shared_strings = _read_shared_strings(archive, cancel_event) if data_filter_config is not None else None
             matching_shared_strings = (
-                _filter_matching_shared_strings(shared_strings, keyword)
+                _filter_matching_shared_strings(shared_strings, keyword, cancel_event)
                 if shared_strings is not None
-                else _read_matching_shared_strings(archive, keyword)
+                else _read_matching_shared_strings(archive, keyword, cancel_event)
             )
+            if _is_cancelled(cancel_event):
+                return []
+
             matching_shared_string_ids = {
                 str(shared_string_index).encode("ascii")
                 for shared_string_index in matching_shared_strings
@@ -119,6 +139,8 @@ def _search_xlsx_xml_cells(
             sheets = _read_workbook_sheets(archive)
             matches: list[ExcelCellMatch] = []
             for sheet_name, sheet_xml_path in sheets:
+                if _is_cancelled(cancel_event):
+                    break
                 if not _should_search_sheet(sheet_name, disabled_sheet_marker):
                     continue
                 matches.extend(
@@ -132,6 +154,7 @@ def _search_xlsx_xml_cells(
                         keyword,
                         shared_strings,
                         data_filter_config,
+                        cancel_event,
                     )
                 )
             return matches
@@ -170,7 +193,7 @@ def _read_workbook_relationships(archive: zipfile.ZipFile) -> dict[str, str]:
     return relationships
 
 
-def _read_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+def _read_shared_strings(archive: zipfile.ZipFile, cancel_event: Event | None = None) -> list[str]:
     try:
         shared_strings_xml = archive.read(SHARED_STRINGS_PART_PATH)
     except KeyError:
@@ -179,6 +202,8 @@ def _read_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     shared_strings: list[str] = []
     with BytesIO(shared_strings_xml) as stream:
         for _event, element in ElementTree.iterparse(stream, events=("end",)):
+            if _is_cancelled(cancel_event):
+                break
             if element.tag != SHARED_STRING_ITEM_TAG and _local_name(element.tag) != "si":
                 continue
             shared_strings.append(_rich_text(element))
@@ -186,18 +211,31 @@ def _read_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     return shared_strings
 
 
-def _filter_matching_shared_strings(shared_strings: list[str], keyword: str) -> dict[int, str]:
-    return {
-        shared_string_index: text
-        for shared_string_index, text in enumerate(shared_strings)
-        if _get_matched_text(text, keyword) is not None
-    }
+def _filter_matching_shared_strings(
+    shared_strings: list[str],
+    keyword: str,
+    cancel_event: Event | None = None,
+) -> dict[int, str]:
+    matches: dict[int, str] = {}
+    for shared_string_index, text in enumerate(shared_strings):
+        if _is_cancelled(cancel_event):
+            break
+        if _get_matched_text(text, keyword) is not None:
+            matches[shared_string_index] = text
+    return matches
 
 
-def _read_matching_shared_strings(archive: zipfile.ZipFile, keyword: str) -> dict[int, str]:
+def _read_matching_shared_strings(
+    archive: zipfile.ZipFile,
+    keyword: str,
+    cancel_event: Event | None = None,
+) -> dict[int, str]:
     try:
         shared_strings_xml = archive.read(SHARED_STRINGS_PART_PATH)
     except KeyError:
+        return {}
+
+    if _is_cancelled(cancel_event):
         return {}
 
     normalized_shared_strings_xml = shared_strings_xml.lower()
@@ -208,6 +246,8 @@ def _read_matching_shared_strings(archive: zipfile.ZipFile, keyword: str) -> dic
     shared_string_index = 0
     with BytesIO(shared_strings_xml) as stream:
         for _event, element in ElementTree.iterparse(stream, events=("end",)):
+            if _is_cancelled(cancel_event):
+                break
             if element.tag != SHARED_STRING_ITEM_TAG and _local_name(element.tag) != "si":
                 continue
 
@@ -229,6 +269,7 @@ def _search_sheet_xml_cells(
     keyword: str,
     shared_strings: list[str] | None,
     data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
     matches: list[ExcelCellMatch] = []
     current_row_index = 0
@@ -238,13 +279,19 @@ def _search_sheet_xml_cells(
         sheet_xml_path,
         matching_shared_string_ids,
         keyword,
+        cancel_event,
     )
     if sheet_xml is None:
         return matches
 
-    data_filter_state = _build_xlsx_data_filter_state(sheet_xml, shared_strings or [], data_filter_config)
+    if _is_cancelled(cancel_event):
+        return matches
+
+    data_filter_state = _build_xlsx_data_filter_state(sheet_xml, shared_strings or [], data_filter_config, cancel_event)
     with BytesIO(sheet_xml) as stream:
         for event, element in ElementTree.iterparse(stream, events=("start", "end")):
+            if _is_cancelled(cancel_event):
+                break
             if event == "start" and (element.tag == ROW_TAG or _local_name(element.tag) == "row"):
                 current_row_index = _parse_int(element.attrib.get("r"), current_row_index + 1)
                 current_column_index = 0
@@ -283,8 +330,15 @@ def _read_sheet_xml_if_search_hint(
     sheet_xml_path: str,
     matching_shared_string_ids: set[bytes],
     keyword: str,
+    cancel_event: Event | None = None,
 ) -> bytes | None:
+    if _is_cancelled(cancel_event):
+        return None
+
     sheet_xml = archive.read(sheet_xml_path)
+    if _is_cancelled(cancel_event):
+        return None
+
     normalized_sheet_xml = sheet_xml.lower()
 
     if _sheet_xml_has_search_hint(normalized_sheet_xml, matching_shared_string_ids, keyword):
@@ -316,6 +370,7 @@ def _build_xlsx_data_filter_state(
     sheet_xml: bytes,
     shared_strings: list[str],
     data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None = None,
 ) -> DataFilterState | None:
     if data_filter_config is None:
         return None
@@ -329,6 +384,8 @@ def _build_xlsx_data_filter_state(
 
     with BytesIO(sheet_xml) as stream:
         for event, element in ElementTree.iterparse(stream, events=("start", "end")):
+            if _is_cancelled(cancel_event):
+                return None
             if event == "start" and (element.tag == ROW_TAG or _local_name(element.tag) == "row"):
                 current_row_index = _parse_int(element.attrib.get("r"), current_row_index + 1)
                 current_column_index = 0
@@ -619,6 +676,7 @@ def _search_xlrd_cells(
     keyword: str,
     disabled_sheet_marker: str | None,
     data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
     try:
         import xlrd
@@ -633,11 +691,15 @@ def _search_xlrd_cells(
     matches: list[ExcelCellMatch] = []
     try:
         for sheet_name in workbook.sheet_names():
+            if _is_cancelled(cancel_event):
+                break
             if not _should_search_sheet(sheet_name, disabled_sheet_marker):
                 continue
             worksheet = workbook.sheet_by_name(sheet_name)
-            data_filter_state = _build_xlrd_data_filter_state(worksheet, data_filter_config)
+            data_filter_state = _build_xlrd_data_filter_state(worksheet, data_filter_config, cancel_event)
             for row_offset in range(worksheet.nrows):
+                if _is_cancelled(cancel_event):
+                    break
                 for column_offset in range(worksheet.ncols):
                     row_index = row_offset + 1
                     column_index = column_offset + 1
@@ -669,6 +731,7 @@ def _search_xlsb_cells(
     keyword: str,
     disabled_sheet_marker: str | None,
     data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
     try:
         from pyxlsb import open_workbook
@@ -679,12 +742,22 @@ def _search_xlsb_cells(
     try:
         with open_workbook(str(path)) as workbook:
             for sheet_name in workbook.sheets:
+                if _is_cancelled(cancel_event):
+                    break
                 if not _should_search_sheet(sheet_name, disabled_sheet_marker):
                     continue
                 with workbook.get_sheet(sheet_name) as worksheet:
-                    rows = [[cell.v for cell in row] for row in worksheet.rows()]
+                    rows: list[list[object]] = []
+                    for row in worksheet.rows():
+                        if _is_cancelled(cancel_event):
+                            break
+                        rows.append([cell.v for cell in row])
+                    if _is_cancelled(cancel_event):
+                        break
                     data_filter_state = _build_tabular_data_filter_state(rows, data_filter_config)
                     for row_index, row in enumerate(rows, start=1):
+                        if _is_cancelled(cancel_event):
+                            break
                         for column_index, value in enumerate(row, start=1):
                             if not _is_enabled_cell(row_index, column_index, data_filter_state):
                                 continue
@@ -706,7 +779,11 @@ def _search_xlsb_cells(
         raise ExcelReadError(f"Could not open Excel file: {path}") from exc
 
 
-def _build_xlrd_data_filter_state(worksheet: object, data_filter_config: DataFilterConfig | None) -> DataFilterState | None:
+def _build_xlrd_data_filter_state(
+    worksheet: object,
+    data_filter_config: DataFilterConfig | None,
+    cancel_event: Event | None = None,
+) -> DataFilterState | None:
     if data_filter_config is None:
         return None
 
@@ -719,11 +796,15 @@ def _build_xlrd_data_filter_state(worksheet: object, data_filter_config: DataFil
 
     if data_filter_config.enable_column_filter and 0 <= marker_row_offset < getattr(worksheet, "nrows", 0):
         for column_offset in range(getattr(worksheet, "ncols", 0)):
+            if _is_cancelled(cancel_event):
+                return None
             marker_row_values[column_offset + 1] = _clean_filter_text(
                 worksheet.cell_value(marker_row_offset, column_offset)
             )
 
     for row_offset in range(getattr(worksheet, "nrows", 0)):
+        if _is_cancelled(cancel_event):
+            return None
         if (
             data_filter_config.enable_disabled_row_filter
             and 0 <= disabled_row_marker_column_offset < getattr(worksheet, "ncols", 0)
@@ -792,6 +873,10 @@ def _build_tabular_data_filter_state(
 def _should_search_sheet(sheet_name: str, disabled_sheet_marker: str | None) -> bool:
     marker = (disabled_sheet_marker or "").strip()
     return not marker or not sheet_name.startswith(marker)
+
+
+def _is_cancelled(cancel_event: Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
 
 
 def _get_matched_text(value: object, keyword: str) -> str | None:

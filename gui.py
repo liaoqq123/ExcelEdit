@@ -5,7 +5,7 @@ import sys
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
@@ -24,6 +24,7 @@ from worksheet_search import (
     ExcelSheetReference,
     ExcelWorkbookInfo,
     ReferenceLookupConfig,
+    WORKSHEET_SHEET_CACHE_KEY,
     find_sheet_reference_matches,
     scan_excel_workbooks,
     validate_reference_lookup_config,
@@ -86,6 +87,8 @@ class ExcelEditApp(ctk.CTk):
         self.settings_dialog = SettingsDialog(self, DEFAULT_DISABLED_SHEET_MARKER, self._apply_settings)
         self.settings_button: ctk.CTkButton | None = None
         self.help_button: ctk.CTkButton | None = None
+        self.cancel_search_button: ctk.CTkButton | None = None
+        self.search_cancel_event: Event | None = None
 
         self._build_layout()
         self._load_cached_inputs()
@@ -164,8 +167,20 @@ class ExcelEditApp(ctk.CTk):
         )
         self.search_mode_menu.grid(row=0, column=0, padx=(12, 8), pady=(12, 6), sticky="w")
 
+        self.cancel_search_button = ctk.CTkButton(
+            action_frame,
+            text="取消",
+            width=82,
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            text_color="#ffffff",
+            command=self.cancel_current_search,
+        )
+        self.cancel_search_button.grid(row=0, column=2, padx=(8, 0), pady=(12, 6), sticky="e")
+        self.cancel_search_button.grid_remove()
+
         self.run_search_button = ctk.CTkButton(action_frame, text="检索", width=110, command=self.run_selected_search)
-        self.run_search_button.grid(row=0, column=2, padx=(8, 12), pady=(12, 6), sticky="e")
+        self.run_search_button.grid(row=0, column=3, padx=(8, 12), pady=(12, 6), sticky="e")
 
         self.status_label = ctk.CTkLabel(action_frame, text="请选择文件夹后执行检索", anchor="w")
         self.status_label.grid(row=0, column=1, padx=8, pady=(12, 6), sticky="ew")
@@ -380,11 +395,15 @@ class ExcelEditApp(ctk.CTk):
 
         self.current_keyword = self.keyword_entry.get().strip()
         self._save_cache_from_inputs()
-        self._set_search_controls_running(True)
+        cancel_event = self._begin_search()
         self.status_label.configure(text="正在检索 Excel 文件，请稍等")
         self._clear_results()
 
-        worker = Thread(target=self._scan_in_background, args=(folder_path, self.current_keyword), daemon=True)
+        worker = Thread(
+            target=self._scan_in_background,
+            args=(folder_path, self.current_keyword, cancel_event),
+            daemon=True,
+        )
         worker.start()
 
     def start_cell_search(self) -> None:
@@ -404,7 +423,7 @@ class ExcelEditApp(ctk.CTk):
             return
 
         self._save_cache_from_inputs()
-        self._set_search_controls_running(True)
+        cancel_event = self._begin_search()
         disabled_marker = self.disabled_sheet_marker if self.only_enabled_sheets_var.get() else None
         data_filter_config = self._get_cell_search_data_filter_config()
         search_scope_parts: list[str] = []
@@ -420,7 +439,7 @@ class ExcelEditApp(ctk.CTk):
 
         worker = Thread(
             target=self._search_cells_in_background,
-            args=(folder_path, keyword, disabled_marker, data_filter_config),
+            args=(folder_path, keyword, disabled_marker, data_filter_config, cancel_event),
             daemon=True,
         )
         worker.start()
@@ -437,13 +456,19 @@ class ExcelEditApp(ctk.CTk):
             header_row_count=config.header_row_count,
         )
 
-    def _scan_in_background(self, folder_path: Path, keyword: str) -> None:
+    def _scan_in_background(self, folder_path: Path, keyword: str, cancel_event: Event) -> None:
         try:
-            results = scan_excel_workbooks(folder_path, keyword)
+            results = scan_excel_workbooks(folder_path, keyword, cancel_event=cancel_event)
         except ExcelReadError as exc:
-            self.after(0, lambda: self._scan_failed(str(exc)))
+            if cancel_event.is_set():
+                self.after(0, self._search_cancelled)
+            else:
+                self.after(0, lambda: self._scan_failed(str(exc)))
             return
 
+        if cancel_event.is_set():
+            self.after(0, self._search_cancelled)
+            return
         self.after(0, lambda: self._scan_finished(results))
 
     def _search_cells_in_background(
@@ -452,6 +477,7 @@ class ExcelEditApp(ctk.CTk):
         keyword: str,
         disabled_marker: str | None,
         data_filter_config: DataFilterConfig | None,
+        cancel_event: Event,
     ) -> None:
         try:
             matches = search_excel_cells(
@@ -459,19 +485,48 @@ class ExcelEditApp(ctk.CTk):
                 keyword,
                 disabled_sheet_marker=disabled_marker,
                 data_filter_config=data_filter_config,
+                cancel_event=cancel_event,
             )
         except ExcelReadError as exc:
-            self.after(0, lambda: self._cell_search_failed(str(exc)))
+            if cancel_event.is_set():
+                self.after(0, self._search_cancelled)
+            else:
+                self.after(0, lambda: self._cell_search_failed(str(exc)))
             return
 
+        if cancel_event.is_set():
+            self.after(0, self._search_cancelled)
+            return
         self.after(0, lambda: self._cell_search_finished(matches, keyword))
 
+    def _begin_search(self) -> Event:
+        cancel_event = Event()
+        self.search_cancel_event = cancel_event
+        self._set_search_controls_running(True)
+        return cancel_event
+
+    def cancel_current_search(self) -> None:
+        if self.search_cancel_event is None:
+            return
+
+        self.search_cancel_event.set()
+        if self.cancel_search_button is not None:
+            self.cancel_search_button.configure(state="disabled", text="取消中...")
+        self.status_label.configure(text="正在取消检索，请稍等")
+
+    def _search_cancelled(self) -> None:
+        self.search_cancel_event = None
+        self._set_search_controls_running(False)
+        self.status_label.configure(text="已取消检索")
+
     def _scan_failed(self, message: str) -> None:
+        self.search_cancel_event = None
         self._set_search_controls_running(False)
         self.status_label.configure(text="检索失败")
         messagebox.showerror("检索失败", message)
 
     def _scan_finished(self, results: list[ExcelWorkbookInfo]) -> None:
+        self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_results(results)
         if not results:
@@ -485,11 +540,13 @@ class ExcelEditApp(ctk.CTk):
         self.status_label.configure(text=f"检索完成：{workbook_count} 个工作簿，{row_count} 条结果")
 
     def _cell_search_failed(self, message: str) -> None:
+        self.search_cancel_event = None
         self._set_search_controls_running(False)
         self.status_label.configure(text="单元格搜索失败")
         messagebox.showerror("单元格搜索失败", message)
 
     def _cell_search_finished(self, matches: list[ExcelCellMatch], keyword: str) -> None:
+        self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_cell_matches(matches)
         self.status_label.configure(text=f"单元格搜索完成：找到 {len(matches)} 条匹配")
@@ -498,6 +555,9 @@ class ExcelEditApp(ctk.CTk):
         if is_running:
             self.run_search_button.configure(state="disabled", text="检索中...")
             self.search_mode_menu.configure(state="disabled")
+            if self.cancel_search_button is not None:
+                self.cancel_search_button.configure(state="normal", text="取消")
+                self.cancel_search_button.grid()
             if self.settings_button is not None:
                 self.settings_button.configure(state="disabled")
             self.only_enabled_sheets_checkbox.configure(state="disabled")
@@ -506,6 +566,8 @@ class ExcelEditApp(ctk.CTk):
 
         self.run_search_button.configure(state="normal", text="检索")
         self.search_mode_menu.configure(state="normal")
+        if self.cancel_search_button is not None:
+            self.cancel_search_button.grid_remove()
         if self.settings_button is not None:
             self.settings_button.configure(state="normal")
         self.only_enabled_sheets_checkbox.configure(state="normal")
@@ -903,17 +965,15 @@ class ExcelEditApp(ctk.CTk):
         )
 
     def close_app(self) -> None:
+        if self.search_cancel_event is not None:
+            self.search_cancel_event.set()
         self._save_cache_from_inputs()
         self.destroy()
 
 
 def load_cache_data() -> dict[str, object]:
-    try:
-        raw_data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-    if not isinstance(raw_data, dict):
+    raw_data = read_cache_file()
+    if not raw_data:
         return {}
 
     folder_path = raw_data.get("folder_path", "")
@@ -932,6 +992,18 @@ def load_cache_data() -> dict[str, object]:
     }
 
 
+def read_cache_file() -> dict[str, object]:
+    try:
+        raw_data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(raw_data, dict):
+        return {}
+
+    return raw_data
+
+
 def save_cache_data(cache_data: dict[str, object]) -> None:
     reference_config = cache_data.get("reference_config", DEFAULT_REFERENCE_LOOKUP_CONFIG)
     if not isinstance(reference_config, ReferenceLookupConfig):
@@ -940,7 +1012,8 @@ def save_cache_data(cache_data: dict[str, object]) -> None:
     if not isinstance(data_filter_config, DataFilterConfig):
         data_filter_config = DEFAULT_DATA_FILTER_CONFIG
 
-    payload = {
+    payload = read_cache_file()
+    payload.update({
         "folder_path": str(cache_data.get("folder_path", "")),
         "keyword": str(cache_data.get("keyword", "")),
         "reference_config": reference_config_to_dict(reference_config),
@@ -949,7 +1022,10 @@ def save_cache_data(cache_data: dict[str, object]) -> None:
         "help_url": str(cache_data.get("help_url", "")),
         "only_enabled_sheets": bool(cache_data.get("only_enabled_sheets", False)),
         "only_enabled_data": bool(cache_data.get("only_enabled_data", False)),
-    }
+    })
+    worksheet_sheet_cache = cache_data.get(WORKSHEET_SHEET_CACHE_KEY, payload.get(WORKSHEET_SHEET_CACHE_KEY, {}))
+    if isinstance(worksheet_sheet_cache, dict):
+        payload[WORKSHEET_SHEET_CACHE_KEY] = worksheet_sheet_cache
     try:
         CACHE_FILE.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),

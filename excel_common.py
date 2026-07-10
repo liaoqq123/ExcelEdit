@@ -1,5 +1,7 @@
 from pathlib import Path
 from typing import Iterable, Sequence
+import zipfile
+import xml.etree.ElementTree as ET
 
 from openpyxl import load_workbook
 from xlsxwriter import Workbook
@@ -19,7 +21,7 @@ def get_sheet_names(file_path: str | Path) -> list[str]:
 
     suffix = path.suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        return _get_openpyxl_sheet_names(path)
+        return _get_xlsx_xml_sheet_names(path)
     if suffix == ".xls":
         return _get_xlrd_sheet_names(path)
     if suffix == ".xlsb":
@@ -100,6 +102,33 @@ def write_rows_to_excel(
             worksheet.write(row_index, column_index, value)
 
     workbook.close()
+
+
+def _get_xlsx_xml_sheet_names(path: Path) -> list[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            with archive.open("xl/workbook.xml") as workbook_xml:
+                root = ET.parse(workbook_xml).getroot()
+    except KeyError as exc:
+        raise ExcelReadError(f"Could not read workbook metadata: {path}") from exc
+    except (OSError, zipfile.BadZipFile, ET.ParseError) as exc:
+        raise ExcelReadError(f"Could not open Excel file: {path}") from exc
+
+    sheet_names: list[str] = []
+    for element in root.iter():
+        if _xml_local_name(element.tag) != "sheet":
+            continue
+        sheet_name = element.attrib.get("name")
+        if sheet_name is not None:
+            sheet_names.append(sheet_name)
+
+    return sheet_names
+
+
+def _xml_local_name(tag: str) -> str:
+    if "}" not in tag:
+        return tag
+    return tag.rsplit("}", 1)[1]
 
 
 def _get_openpyxl_sheet_names(path: Path) -> list[str]:

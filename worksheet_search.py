@@ -1,6 +1,9 @@
+import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Lock
 
 from openpyxl import load_workbook
 
@@ -37,30 +40,226 @@ class ExcelSheetReference:
 
 
 DEFAULT_REFERENCE_LOOKUP_CONFIG = ReferenceLookupConfig()
+APP_CACHE_FILE = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+) / "cache_data.json"
+LEGACY_SHEET_NAME_CACHE_FILE = APP_CACHE_FILE.with_name("worksheet_sheet_cache.json")
+WORKSHEET_SHEET_CACHE_KEY = "worksheet_sheet_cache"
+_sheet_name_cache: dict[str, dict[str, object]] | None = None
+_sheet_name_cache_dirty = False
+_sheet_name_cache_lock = Lock()
 
 
-def scan_excel_workbooks(folder_path: str | Path, keyword: str = "") -> list[ExcelWorkbookInfo]:
+def scan_excel_workbooks(
+    folder_path: str | Path,
+    keyword: str = "",
+    cancel_event: Event | None = None,
+) -> list[ExcelWorkbookInfo]:
     normalized_keyword = keyword.strip().lower()
     results: list[ExcelWorkbookInfo] = []
 
-    for path in iter_excel_files(folder_path):
-        try:
-            sheet_names = get_sheet_names(path)
-            error = None
-        except ExcelReadError as exc:
-            sheet_names = []
-            error = str(exc)
+    try:
+        for path in iter_excel_files(folder_path):
+            if _is_cancelled(cancel_event):
+                break
 
-        workbook = ExcelWorkbookInfo(
-            path=path,
-            workbook_name=path.name,
-            sheet_names=sheet_names,
-            error=error,
-        )
-        if _matches_keyword(workbook, normalized_keyword):
-            results.append(workbook)
+            path_matches = _path_matches_keyword(path, normalized_keyword)
+            try:
+                sheet_names = _get_cached_sheet_names(path)
+                error = None
+            except ExcelReadError as exc:
+                sheet_names = []
+                error = str(exc)
+
+            if _is_cancelled(cancel_event):
+                break
+
+            if error is not None:
+                if not normalized_keyword or path_matches:
+                    results.append(
+                        ExcelWorkbookInfo(
+                            path=path,
+                            workbook_name=path.name,
+                            sheet_names=[],
+                            error=error,
+                        )
+                    )
+                continue
+
+            if not normalized_keyword or path_matches:
+                matched_sheet_names = sheet_names
+            else:
+                matched_sheet_names = _filter_sheet_names(sheet_names, normalized_keyword)
+                if not matched_sheet_names:
+                    continue
+
+            results.append(
+                ExcelWorkbookInfo(
+                    path=path,
+                    workbook_name=path.name,
+                    sheet_names=matched_sheet_names,
+                    error=None,
+                )
+            )
+    finally:
+        _flush_sheet_name_cache()
 
     return results
+
+
+def _is_cancelled(cancel_event: Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _path_matches_keyword(path: Path, keyword: str) -> bool:
+    if not keyword:
+        return True
+
+    return any(
+        keyword in part.lower()
+        for part in (
+            path.name,
+            path.stem,
+            str(path),
+        )
+    )
+
+
+def _filter_sheet_names(sheet_names: list[str], keyword: str) -> list[str]:
+    if not keyword:
+        return sheet_names
+
+    return [sheet_name for sheet_name in sheet_names if keyword in sheet_name.lower()]
+
+
+def _get_cached_sheet_names(path: Path) -> list[str]:
+    cache_key = str(path.resolve())
+    size, mtime_ns = _get_file_cache_marker(path)
+
+    with _sheet_name_cache_lock:
+        cache = _load_sheet_name_cache_unlocked()
+        cached_entry = cache.get(cache_key)
+        cached_sheet_names = _read_cached_sheet_names(cached_entry, size, mtime_ns)
+        if cached_sheet_names is not None:
+            return cached_sheet_names
+
+    sheet_names = get_sheet_names(path)
+
+    with _sheet_name_cache_lock:
+        cache = _load_sheet_name_cache_unlocked()
+        cache[cache_key] = {
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "sheet_names": sheet_names,
+        }
+        global _sheet_name_cache_dirty
+        _sheet_name_cache_dirty = True
+
+    return sheet_names
+
+
+def _get_file_cache_marker(path: Path) -> tuple[int, int]:
+    try:
+        file_stat = path.stat()
+    except OSError as exc:
+        raise ExcelReadError(f"Could not read file metadata: {path}") from exc
+    return file_stat.st_size, file_stat.st_mtime_ns
+
+
+def _load_sheet_name_cache_unlocked() -> dict[str, dict[str, object]]:
+    global _sheet_name_cache, _sheet_name_cache_dirty
+
+    if _sheet_name_cache is not None:
+        return _sheet_name_cache
+
+    try:
+        raw_data = json.loads(APP_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        legacy_cache = _load_legacy_sheet_name_cache()
+        if legacy_cache:
+            _sheet_name_cache_dirty = True
+        _sheet_name_cache = legacy_cache
+        return _sheet_name_cache
+
+    if not isinstance(raw_data, dict):
+        _sheet_name_cache = {}
+        return _sheet_name_cache
+
+    raw_cache = raw_data.get(WORKSHEET_SHEET_CACHE_KEY)
+    if not isinstance(raw_cache, dict):
+        legacy_cache = _load_legacy_sheet_name_cache()
+        if legacy_cache:
+            _sheet_name_cache_dirty = True
+        _sheet_name_cache = legacy_cache
+        return _sheet_name_cache
+
+    _sheet_name_cache = {
+        str(cache_key): cache_entry
+        for cache_key, cache_entry in raw_cache.items()
+        if isinstance(cache_entry, dict)
+    }
+    return _sheet_name_cache
+
+
+def _load_legacy_sheet_name_cache() -> dict[str, dict[str, object]]:
+    try:
+        raw_cache = json.loads(LEGACY_SHEET_NAME_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(raw_cache, dict):
+        return {}
+
+    return {
+        str(cache_key): cache_entry
+        for cache_key, cache_entry in raw_cache.items()
+        if isinstance(cache_entry, dict)
+    }
+
+
+def _read_cached_sheet_names(
+    cached_entry: dict[str, object] | None,
+    size: int,
+    mtime_ns: int,
+) -> list[str] | None:
+    if not isinstance(cached_entry, dict):
+        return None
+    if cached_entry.get("size") != size or cached_entry.get("mtime_ns") != mtime_ns:
+        return None
+
+    sheet_names = cached_entry.get("sheet_names")
+    if not isinstance(sheet_names, list) or not all(isinstance(item, str) for item in sheet_names):
+        return None
+
+    return list(sheet_names)
+
+
+def _flush_sheet_name_cache() -> None:
+    global _sheet_name_cache_dirty
+
+    with _sheet_name_cache_lock:
+        if _sheet_name_cache is None or not _sheet_name_cache_dirty:
+            return
+        cache_payload = dict(_sheet_name_cache)
+        _sheet_name_cache_dirty = False
+
+    try:
+        try:
+            raw_data = json.loads(APP_CACHE_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_data = {}
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+
+        raw_data[WORKSHEET_SHEET_CACHE_KEY] = cache_payload
+        APP_CACHE_FILE.write_text(
+            json.dumps(raw_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def find_sheet_references(
@@ -222,19 +421,6 @@ def _find_xlsb_sheet_reference_matches(
         raise
     except Exception as exc:
         raise ExcelReadError(f"Could not open Excel file: {path}") from exc
-
-
-def _matches_keyword(workbook: ExcelWorkbookInfo, keyword: str) -> bool:
-    if not keyword:
-        return True
-
-    searchable_parts = [
-        workbook.workbook_name,
-        workbook.path.stem,
-        str(workbook.path),
-        *workbook.sheet_names,
-    ]
-    return any(keyword in part.lower() for part in searchable_parts)
 
 
 def _get_openpyxl_row_values(worksheet: object, row_index: int) -> dict[int, str]:
