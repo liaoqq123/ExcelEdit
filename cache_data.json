@@ -1,6 +1,6 @@
 {
-  "folder_path": "D:/xy/data/dev",
-  "keyword": "Kt_Picture_240702_04",
+  "folder_path": "D:/xy/assets_k/resTemp",
+  "keyword": "actorpic_100004_skin01",
   "reference_config": {
     "sample_text": "FOREIGN:BBB.Id",
     "reference_row_index": 6,
@@ -24,8 +24,8 @@
     "range_end_text": "End"
   },
   "help_url": "",
-  "only_enabled_sheets": true,
-  "only_enabled_data": true,
+  "only_enabled_sheets": false,
+  "only_enabled_data": false,
   "worksheet_sheet_cache": {
     "D:\\xy\\data\\dev\\AchievementLevelConfig.xlsx": {
       "size": 14145,
@@ -270,7 +270,7 @@
     },
     "D:\\xy\\data\\dev\\ActivityConfig.xlsx": {
       "size": 309557,
-      "mtime_ns": 1783495466115411500,
+      "mtime_ns": 1783655402555868700,
       "sheet_names": [
         "$备注",
         "正式开服",
@@ -3308,8 +3308,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\SpineConfig.xlsx": {
-      "size": 62218,
-      "mtime_ns": 1783599126917752600,
+      "size": 62239,
+      "mtime_ns": 1783674801781336600,
       "sheet_names": [
         "$英雄",
         "$备注",
@@ -3320,8 +3320,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\SpineSEConfig.xlsx": {
-      "size": 54941,
-      "mtime_ns": 1783599126920475400,
+      "size": 54877,
+      "mtime_ns": 1783674801783136700,
       "sheet_names": [
         "英雄",
         "怪物",
@@ -3531,8 +3531,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateItem.xlsx": {
-      "size": 248661,
-      "mtime_ns": 1783588323186593300,
+      "size": 250479,
+      "mtime_ns": 1783674976001359200,
       "sheet_names": [
         "$备注",
         "埼玉藏品",
@@ -3568,8 +3568,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateUi.xlsx": {
-      "size": 1440221,
-      "mtime_ns": 1783588353134582100,
+      "size": 1447519,
+      "mtime_ns": 1783681300301512800,
       "sheet_names": [
         "$备注",
         "界面文字",
@@ -3606,8 +3606,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateUiPrefab.xlsx": {
-      "size": 46791,
-      "mtime_ns": 1783588090547545500,
+      "size": 47034,
+      "mtime_ns": 1783671900593743400,
       "sheet_names": [
         "prefab文本"
       ]
@@ -3830,8 +3830,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\UnlockSystem.xlsx": {
-      "size": 42941,
-      "mtime_ns": 1783588120550476000,
+      "size": 42981,
+      "mtime_ns": 1783655393422921800,
       "sheet_names": [
         "UnlockSystem",
         "$"

@@ -18,6 +18,7 @@ from cell_search import (
     validate_data_filter_config,
 )
 from excel_common import ExcelReadError
+from file_search import FileSearchResult, search_files
 from popup_gui import SettingsDialog, parse_positive_int
 from worksheet_search import (
     DEFAULT_REFERENCE_LOOKUP_CONFIG,
@@ -52,6 +53,10 @@ CELL_RESULT_COLUMNS = (
     ("column", "列", 70, 60, False),
     ("value", "数据内容", 500, 260, True),
 )
+FILE_RESULT_COLUMNS = (
+    ("file_name", "文件名", 320, 180, True),
+    ("file_address", "文件地址", 760, 360, True),
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,7 @@ class ResultTarget:
     sheet_name: str | None = None
     row_index: int | None = None
     column_index: int | None = None
+    open_containing_folder: bool = False
 
 
 class ExcelEditApp(ctk.CTk):
@@ -143,7 +149,7 @@ class ExcelEditApp(ctk.CTk):
         keyword_label = ctk.CTkLabel(input_frame, text="输入内容", width=90, anchor="w")
         keyword_label.grid(row=0, column=0, padx=(12, 8), pady=12)
 
-        self.keyword_entry = ctk.CTkEntry(input_frame, placeholder_text="可输入工作簿名或工作表名关键词；留空则显示全部")
+        self.keyword_entry = ctk.CTkEntry(input_frame, placeholder_text="可输入工作簿、工作表、单元格、文件名或文件地址关键词；留空则显示全部")
         self.keyword_entry.grid(row=0, column=1, padx=8, pady=12, sticky="ew")
         self.keyword_entry.bind("<Return>", lambda _event: self.run_selected_search())
         self.keyword_entry.bind("<FocusOut>", lambda _event: self._save_cache_from_inputs())
@@ -154,7 +160,7 @@ class ExcelEditApp(ctk.CTk):
 
         self.search_mode_menu = ctk.CTkOptionMenu(
             action_frame,
-            values=["工作表检索", "单元格检索"],
+            values=["工作表检索", "单元格检索", "文件检索"],
             variable=self.search_mode_var,
             width=140,
             fg_color="#ffffff",
@@ -377,8 +383,12 @@ class ExcelEditApp(ctk.CTk):
         self.status_label.configure(text="设置已保存")
 
     def run_selected_search(self) -> None:
-        if self.search_mode_var.get() == "单元格检索":
+        search_mode = self.search_mode_var.get()
+        if search_mode == "单元格检索":
             self.start_cell_search()
+            return
+        if search_mode == "文件检索":
+            self.start_file_search()
             return
         self.start_scan()
 
@@ -444,6 +454,30 @@ class ExcelEditApp(ctk.CTk):
         )
         worker.start()
 
+    def start_file_search(self) -> None:
+        folder_text = self.folder_entry.get().strip()
+        if not folder_text:
+            messagebox.showinfo("缺少文件夹", "请先选择或输入一个文件夹地址。")
+            return
+
+        folder_path = Path(folder_text)
+        if not folder_path.exists() or not folder_path.is_dir():
+            messagebox.showerror("文件夹无效", "请输入有效的文件夹地址。")
+            return
+
+        keyword = self.keyword_entry.get().strip()
+        self._save_cache_from_inputs()
+        cancel_event = self._begin_search()
+        self.status_label.configure(text="正在检索文件名和文件地址，请稍等")
+        self._clear_results()
+
+        worker = Thread(
+            target=self._search_files_in_background,
+            args=(folder_path, keyword, cancel_event),
+            daemon=True,
+        )
+        worker.start()
+
     def _get_cell_search_data_filter_config(self) -> DataFilterConfig | None:
         config = self.data_filter_config
         include_enabled_data_filters = self.only_enabled_data_var.get()
@@ -499,6 +533,21 @@ class ExcelEditApp(ctk.CTk):
             return
         self.after(0, lambda: self._cell_search_finished(matches, keyword))
 
+    def _search_files_in_background(self, folder_path: Path, keyword: str, cancel_event: Event) -> None:
+        try:
+            results = search_files(folder_path, keyword, cancel_event=cancel_event)
+        except ExcelReadError as exc:
+            if cancel_event.is_set():
+                self.after(0, self._search_cancelled)
+            else:
+                self.after(0, lambda: self._file_search_failed(str(exc)))
+            return
+
+        if cancel_event.is_set():
+            self.after(0, self._search_cancelled)
+            return
+        self.after(0, lambda: self._file_search_finished(results))
+
     def _begin_search(self) -> Event:
         cancel_event = Event()
         self.search_cancel_event = cancel_event
@@ -550,6 +599,18 @@ class ExcelEditApp(ctk.CTk):
         self._set_search_controls_running(False)
         self._render_cell_matches(matches)
         self.status_label.configure(text=f"单元格搜索完成：找到 {len(matches)} 条匹配")
+
+    def _file_search_failed(self, message: str) -> None:
+        self.search_cancel_event = None
+        self._set_search_controls_running(False)
+        self.status_label.configure(text="文件检索失败")
+        messagebox.showerror("文件检索失败", message)
+
+    def _file_search_finished(self, results: list[FileSearchResult]) -> None:
+        self.search_cancel_event = None
+        self._set_search_controls_running(False)
+        self._render_file_results(results)
+        self.status_label.configure(text=f"文件检索完成：找到 {len(results)} 个文件")
 
     def _set_search_controls_running(self, is_running: bool) -> None:
         if is_running:
@@ -617,6 +678,22 @@ class ExcelEditApp(ctk.CTk):
                     match.column_index,
                 )
 
+    def _render_file_results(self, results: list[FileSearchResult]) -> None:
+        self._clear_results()
+        self._configure_result_columns(FILE_RESULT_COLUMNS)
+
+        if not results:
+            self.status_label.configure(text="没有找到匹配的文件")
+            return
+
+        for result in results:
+            item_id = self.result_tree.insert(
+                "",
+                "end",
+                values=(result.file_name, result.file_address),
+            )
+            self.item_targets[item_id] = ResultTarget(result.path, open_containing_folder=True)
+
     def _toggle_tree_item(self, item_id: str) -> None:
         if self.result_tree.get_children(item_id):
             self.result_tree.item(item_id, open=not bool(self.result_tree.item(item_id, "open")))
@@ -637,8 +714,11 @@ class ExcelEditApp(ctk.CTk):
             return
 
         try:
+            if target.open_containing_folder:
+                open_containing_folder(target.file_path)
+                return
             open_file(target.file_path, target.sheet_name, target.row_index, target.column_index)
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             messagebox.showerror("打开失败", f"无法打开文件：{target.file_path}\n{exc}")
 
     def _clear_results(self) -> None:
@@ -1183,6 +1263,25 @@ def format_reference_label(reference: ExcelSheetReference) -> str:
     if reference.source_field_name:
         parts.append(f"本表字段：{reference.source_field_name}")
     return "，".join(parts)
+
+
+def open_containing_folder(file_path: Path) -> bool:
+    if file_path.is_dir():
+        folder_path = file_path
+    else:
+        folder_path = file_path.parent
+
+    if sys.platform.startswith("win"):
+        if file_path.exists() and file_path.is_file():
+            subprocess.Popen(["explorer", f"/select,{file_path}"])
+            return True
+        os.startfile(str(folder_path))
+        return True
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(folder_path)])
+        return False
+    subprocess.Popen(["xdg-open", str(folder_path)])
+    return False
 
 
 def open_file(
