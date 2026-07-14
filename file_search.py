@@ -1,20 +1,33 @@
+"""普通文件名检索功能。
+
+这个模块只查固定目录下的文件名和完整路径，不读取文件内容。
+"""
+
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 
-from excel_common import ExcelReadError
-
 
 @dataclass(frozen=True)
 class FileSearchResult:
+    """文件检索结果，供界面列表直接展示和双击打开目录。"""
+
     path: Path
     file_name: str
     file_address: str
 
 
+class FileSearchError(RuntimeError):
+    """文件检索路径校验失败时抛出的错误。"""
+
+    pass
+
+
 def search_files(folder_path: str | Path, keyword: str = "", cancel_event: Event | None = None) -> list[FileSearchResult]:
+    """递归检索文件名和文件地址，关键词为空时返回全部文件。"""
+
     folder = _validate_folder(folder_path)
     normalized_keyword = keyword.strip().lower()
     results: list[FileSearchResult] = []
@@ -33,6 +46,8 @@ def search_files(folder_path: str | Path, keyword: str = "", cancel_event: Event
 
 
 def _iter_file_paths(folder: Path, cancel_event: Event | None) -> Iterator[Path]:
+    """用 os.scandir 递归遍历目录，比逐个 Path.iterdir 更轻量。"""
+
     stack = [folder]
 
     while stack:
@@ -57,17 +72,23 @@ def _iter_file_paths(folder: Path, cancel_event: Event | None) -> Iterator[Path]
 
 
 def _matches_keyword(file_name: str, file_address: str, keyword: str) -> bool:
+    """判断关键词是否出现在文件名或完整路径中。"""
+
     return keyword in file_name.lower() or keyword in file_address.lower()
 
 
 def _validate_folder(folder_path: str | Path) -> Path:
+    """确认待检索路径存在且是文件夹。"""
+
     folder = Path(folder_path)
     if not folder.exists():
-        raise ExcelReadError(f"Folder does not exist: {folder}")
+        raise FileSearchError(f"Folder does not exist: {folder}")
     if not folder.is_dir():
-        raise ExcelReadError(f"Not a folder: {folder}")
+        raise FileSearchError(f"Not a folder: {folder}")
     return folder
 
 
 def _is_cancelled(cancel_event: Event | None) -> bool:
+    """后台检索线程轮询这个状态来尽快响应取消按钮。"""
+
     return cancel_event is not None and cancel_event.is_set()

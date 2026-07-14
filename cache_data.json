@@ -1,6 +1,6 @@
 {
-  "folder_path": "D:/xy/assets_k/resTemp",
-  "keyword": "actorpic_100004_skin01",
+  "folder_path": "D:\\xy\\data\\dev",
+  "keyword": "GoldHand",
   "reference_config": {
     "sample_text": "FOREIGN:BBB.Id",
     "reference_row_index": 6,
@@ -12,6 +12,7 @@
   "data_filter_config": {
     "enable_header_filter": true,
     "header_row_count": 6,
+    "enable_blank_header_column_filter": true,
     "enable_column_filter": true,
     "column_marker_row_index": 3,
     "disabled_column_marker": "$",
@@ -24,7 +25,7 @@
     "range_end_text": "End"
   },
   "help_url": "",
-  "only_enabled_sheets": false,
+  "only_enabled_sheets": true,
   "only_enabled_data": false,
   "worksheet_sheet_cache": {
     "D:\\xy\\data\\dev\\AchievementLevelConfig.xlsx": {
@@ -269,8 +270,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\ActivityConfig.xlsx": {
-      "size": 309557,
-      "mtime_ns": 1783655402555868700,
+      "size": 309565,
+      "mtime_ns": 1783913396561142700,
       "sheet_names": [
         "$备注",
         "正式开服",
@@ -1159,8 +1160,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\ActivityTranslate.xlsx": {
-      "size": 357458,
-      "mtime_ns": 1783588371998087800,
+      "size": 357339,
+      "mtime_ns": 1783929178225260600,
       "sheet_names": [
         "$备注",
         "Sheet1",
@@ -2834,8 +2835,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\RewardConfig.xlsx": {
-      "size": 1748147,
-      "mtime_ns": 1783480776183203700,
+      "size": 1748340,
+      "mtime_ns": 1783926289162431300,
       "sheet_names": [
         "$备注页",
         "主线一次性奖励",
@@ -3308,8 +3309,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\SpineConfig.xlsx": {
-      "size": 62239,
-      "mtime_ns": 1783674801781336600,
+      "size": 62320,
+      "mtime_ns": 1783913420416570600,
       "sheet_names": [
         "$英雄",
         "$备注",
@@ -3320,8 +3321,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\SpineSEConfig.xlsx": {
-      "size": 54877,
-      "mtime_ns": 1783674801783136700,
+      "size": 54039,
+      "mtime_ns": 1783913420419586500,
       "sheet_names": [
         "英雄",
         "怪物",
@@ -3510,15 +3511,15 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateGuide.xlsx": {
-      "size": 19422,
-      "mtime_ns": 1783320195577569700,
+      "size": 23661,
+      "mtime_ns": 1783926384798749700,
       "sheet_names": [
         "对话"
       ]
     },
     "D:\\xy\\data\\dev\\TranslateHero.xlsx": {
-      "size": 472056,
-      "mtime_ns": 1783480905409667400,
+      "size": 472013,
+      "mtime_ns": 1783926342315925800,
       "sheet_names": [
         "英雄",
         "队长技",
@@ -3531,8 +3532,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateItem.xlsx": {
-      "size": 250479,
-      "mtime_ns": 1783674976001359200,
+      "size": 250639,
+      "mtime_ns": 1783932008096070700,
       "sheet_names": [
         "$备注",
         "埼玉藏品",
@@ -3568,8 +3569,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateUi.xlsx": {
-      "size": 1447519,
-      "mtime_ns": 1783681300301512800,
+      "size": 1448263,
+      "mtime_ns": 1783932001235642500,
       "sheet_names": [
         "$备注",
         "界面文字",
@@ -3866,5 +3867,9 @@
         "$"
       ]
     }
-  }
+  },
+  "folder_history": [
+    "D:\\xy\\data\\dev",
+    "D:/xy/assets_k/resTemp"
+  ]
 }

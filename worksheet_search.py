@@ -1,3 +1,9 @@
+"""工作簿、工作表和引用关系检索逻辑。
+
+界面里的“工作表检索”和“查找引用”按钮主要调用这里的函数。
+工作表名称会按文件大小和修改时间缓存，减少重复打开 Excel 的成本。
+"""
+
 import json
 import re
 import sys
@@ -17,6 +23,8 @@ from excel_common import (
 
 @dataclass(frozen=True)
 class ExcelWorkbookInfo:
+    """一个工作簿的扫描结果。"""
+
     path: Path
     workbook_name: str
     sheet_names: list[str]
@@ -25,6 +33,12 @@ class ExcelWorkbookInfo:
 
 @dataclass(frozen=True)
 class ReferenceLookupConfig:
+    """引用检索规则配置。
+
+    sample_text 用来描述引用结构，table_name 和 field_name 标记其中哪一段
+    是目标表名、哪一段是字段名。
+    """
+
     sample_text: str = "FOREIGN:BBB.Id"
     reference_row_index: int = 6
     table_name: str = "BBB"
@@ -34,6 +48,8 @@ class ReferenceLookupConfig:
 
 @dataclass(frozen=True)
 class ExcelSheetReference:
+    """从某个工作表引用行中解析出的单条引用关系。"""
+
     sheet_name: str
     reference_field_name: str
     source_field_name: str = ""
@@ -57,11 +73,13 @@ def scan_excel_workbooks(
     keyword: str = "",
     cancel_event: Event | None = None,
 ) -> list[ExcelWorkbookInfo]:
+    """扫描目录内 Excel 工作簿，并按关键词过滤工作簿名或工作表名。"""
+
     normalized_keyword = keyword.strip().lower()
     results: list[ExcelWorkbookInfo] = []
 
     try:
-        for path in iter_excel_files(folder_path):
+        for path in iter_excel_files(folder_path, cancel_event=cancel_event):
             if _is_cancelled(cancel_event):
                 break
 
@@ -110,10 +128,14 @@ def scan_excel_workbooks(
 
 
 def _is_cancelled(cancel_event: Event | None) -> bool:
+    """判断后台扫描是否已被取消。"""
+
     return cancel_event is not None and cancel_event.is_set()
 
 
 def _path_matches_keyword(path: Path, keyword: str) -> bool:
+    """判断关键词是否命中文件名、文件主名或完整路径。"""
+
     if not keyword:
         return True
 
@@ -128,6 +150,8 @@ def _path_matches_keyword(path: Path, keyword: str) -> bool:
 
 
 def _filter_sheet_names(sheet_names: list[str], keyword: str) -> list[str]:
+    """只保留名称中包含关键词的工作表。"""
+
     if not keyword:
         return sheet_names
 
@@ -135,6 +159,8 @@ def _filter_sheet_names(sheet_names: list[str], keyword: str) -> list[str]:
 
 
 def _get_cached_sheet_names(path: Path) -> list[str]:
+    """读取工作表名称，并用文件大小和修改时间判断缓存是否有效。"""
+
     cache_key = str(path.resolve())
     size, mtime_ns = _get_file_cache_marker(path)
 
@@ -161,6 +187,8 @@ def _get_cached_sheet_names(path: Path) -> list[str]:
 
 
 def _get_file_cache_marker(path: Path) -> tuple[int, int]:
+    """生成用于判断工作簿是否变化的缓存标记。"""
+
     try:
         file_stat = path.stat()
     except OSError as exc:
@@ -169,6 +197,8 @@ def _get_file_cache_marker(path: Path) -> tuple[int, int]:
 
 
 def _load_sheet_name_cache_unlocked() -> dict[str, dict[str, object]]:
+    """加载工作表名称缓存；调用者必须已经持有缓存锁。"""
+
     global _sheet_name_cache, _sheet_name_cache_dirty
 
     if _sheet_name_cache is not None:
@@ -204,6 +234,8 @@ def _load_sheet_name_cache_unlocked() -> dict[str, dict[str, object]]:
 
 
 def _load_legacy_sheet_name_cache() -> dict[str, dict[str, object]]:
+    """兼容旧版本单独的 worksheet_sheet_cache.json 缓存文件。"""
+
     try:
         raw_cache = json.loads(LEGACY_SHEET_NAME_CACHE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -224,6 +256,8 @@ def _read_cached_sheet_names(
     size: int,
     mtime_ns: int,
 ) -> list[str] | None:
+    """校验缓存条目，只有文件大小和修改时间完全一致才复用。"""
+
     if not isinstance(cached_entry, dict):
         return None
     if cached_entry.get("size") != size or cached_entry.get("mtime_ns") != mtime_ns:
@@ -237,6 +271,8 @@ def _read_cached_sheet_names(
 
 
 def _flush_sheet_name_cache() -> None:
+    """把内存中的工作表名称缓存写回统一缓存文件。"""
+
     global _sheet_name_cache_dirty
 
     with _sheet_name_cache_lock:
@@ -267,6 +303,8 @@ def find_sheet_references(
     sheet_name: str,
     row_index: int = 6,
 ) -> list[str]:
+    """查找指定行内引用到的工作表名称，保留给简化调用场景使用。"""
+
     config = ReferenceLookupConfig(reference_row_index=row_index)
     matches = find_sheet_reference_matches(file_path, sheet_name, config)
     references: list[str] = []
@@ -281,6 +319,8 @@ def find_sheet_reference_matches(
     sheet_name: str,
     config: ReferenceLookupConfig | None = None,
 ) -> list[ExcelSheetReference]:
+    """按照配置解析指定工作表引用行里的所有引用关系。"""
+
     lookup_config = config or DEFAULT_REFERENCE_LOOKUP_CONFIG
     validate_reference_lookup_config(lookup_config)
     path = Path(file_path)
@@ -299,6 +339,8 @@ def find_sheet_reference_matches(
 
 
 def validate_reference_lookup_config(config: ReferenceLookupConfig) -> None:
+    """通过构建正则表达式来验证引用配置是否完整、可解析。"""
+
     _build_reference_pattern(config)
 
 
@@ -307,6 +349,8 @@ def _find_openpyxl_sheet_reference_matches(
     sheet_name: str,
     config: ReferenceLookupConfig,
 ) -> list[ExcelSheetReference]:
+    """读取 xlsx/xlsm 等 openpyxl 支持格式的引用关系。"""
+
     try:
         workbook = load_workbook(path, read_only=True, data_only=True)
     except Exception as exc:
@@ -341,6 +385,8 @@ def _find_xlrd_sheet_reference_matches(
     sheet_name: str,
     config: ReferenceLookupConfig,
 ) -> list[ExcelSheetReference]:
+    """读取老格式 .xls 文件的引用关系。"""
+
     try:
         import xlrd
     except ImportError as exc:
@@ -381,6 +427,8 @@ def _find_xlsb_sheet_reference_matches(
     sheet_name: str,
     config: ReferenceLookupConfig,
 ) -> list[ExcelSheetReference]:
+    """读取 .xlsb 文件的引用关系，只遍历配置里需要的行。"""
+
     try:
         from pyxlsb import open_workbook
     except ImportError as exc:
@@ -424,6 +472,8 @@ def _find_xlsb_sheet_reference_matches(
 
 
 def _get_openpyxl_row_values(worksheet: object, row_index: int) -> dict[int, str]:
+    """读取 openpyxl 工作表指定行的值，并按 1 起始列号保存。"""
+
     values: dict[int, str] = {}
     for row in worksheet.iter_rows(min_row=row_index, max_row=row_index):
         for column_index, cell in enumerate(row, start=1):
@@ -432,6 +482,8 @@ def _get_openpyxl_row_values(worksheet: object, row_index: int) -> dict[int, str
 
 
 def _get_xlrd_row_values(worksheet: object, row_index: int) -> dict[int, str]:
+    """读取 xlrd 工作表指定行的值，并按 1 起始列号保存。"""
+
     row_offset = row_index - 1
     if worksheet.nrows <= row_offset:
         return {}
@@ -448,6 +500,8 @@ def _add_unique_reference_matches(
     source_field_name: str,
     pattern: re.Pattern[str],
 ) -> None:
+    """从单元格文本中提取引用关系，并避免重复加入结果。"""
+
     if value is None:
         return
 
@@ -467,6 +521,8 @@ def _add_unique_reference_matches(
 
 
 def _build_reference_pattern(config: ReferenceLookupConfig) -> re.Pattern[str]:
+    """把用户配置的引用样例转换成可提取表名和字段名的正则。"""
+
     sample_text = config.sample_text.strip()
     table_name = config.table_name.strip()
     field_name = config.field_name.strip()
@@ -504,6 +560,7 @@ def _build_reference_pattern(config: ReferenceLookupConfig) -> re.Pattern[str]:
         pattern_parts.append(re.escape(sample_text[cursor:start]))
         next_start = spans[index + 1][1] if index + 1 < len(spans) else len(sample_text)
         next_literal = sample_text[start + length:next_start]
+        # 如果后面还有固定文本，用非贪婪匹配；末尾字段则遇到空白或常见分隔符停止。
         pattern_parts.append(f"(?P<{group_name}>.+?)" if next_literal else f"(?P<{group_name}>[^\\s,;，；]+)")
         cursor = start + length
     pattern_parts.append(re.escape(sample_text[cursor:]))

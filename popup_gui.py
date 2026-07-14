@@ -1,3 +1,8 @@
+"""设置弹窗界面。
+
+这里集中管理引用规则、未启用标识、启用数据过滤和帮助链接等配置项。
+"""
+
 from collections.abc import Callable
 from tkinter import messagebox
 from decimal import Decimal, InvalidOperation
@@ -16,6 +21,8 @@ from worksheet_search import ReferenceLookupConfig, validate_reference_lookup_co
 
 
 class SettingsDialog:
+    """应用设置弹窗，负责展示、读取、校验并回传配置。"""
+
     def __init__(
         self,
         master: ctk.CTk,
@@ -29,6 +36,7 @@ class SettingsDialog:
         self.reference_setting_entries: dict[str, ctk.CTkEntry] = {}
         self.data_filter_setting_entries: dict[str, ctk.CTkEntry] = {}
         self.enable_header_filter_var: ctk.BooleanVar | None = None
+        self.enable_blank_header_column_filter_var: ctk.BooleanVar | None = None
         self.enable_column_filter_var: ctk.BooleanVar | None = None
         self.enable_disabled_row_filter_var: ctk.BooleanVar | None = None
         self.enable_range_row_filter_var: ctk.BooleanVar | None = None
@@ -42,6 +50,8 @@ class SettingsDialog:
         data_filter_config: DataFilterConfig,
         help_url: str,
     ) -> None:
+        """打开设置窗口，并把当前配置填回输入框。"""
+
         if self.window is None or not self.window.winfo_exists():
             self._build_window()
         self._fill_entries(reference_config, disabled_sheet_marker, data_filter_config, help_url)
@@ -52,6 +62,8 @@ class SettingsDialog:
         self.window.focus_force()
 
     def _build_window(self) -> None:
+        """创建设置窗口控件，只在第一次打开或窗口被销毁后重建。"""
+
         window = ctk.CTkToplevel(self.master)
         window.title("设置")
         window.geometry("660x660")
@@ -71,6 +83,7 @@ class SettingsDialog:
         reference_tab = tab_view.tab("引用数据修改")
         reference_tab.grid_columnconfigure(1, weight=1)
 
+        # 引用配置决定“查找引用”按钮如何从指定行提取目标表名和字段名。
         fields = (
             ("sample_text", "引用样例", "AAA:BBB.CCC"),
             ("reference_row_index", "引用行", "6"),
@@ -106,10 +119,21 @@ class SettingsDialog:
             "表头长度",
             str(DEFAULT_DATA_FILTER_CONFIG.header_row_count),
         )
+        self.enable_blank_header_column_filter_var = ctk.BooleanVar(
+            value=DEFAULT_DATA_FILTER_CONFIG.enable_blank_header_column_filter
+        )
+        blank_header_filter_checkbox = ctk.CTkCheckBox(
+            base_tab,
+            text="屏蔽空白表头",
+            variable=self.enable_blank_header_column_filter_var,
+            command=self._update_data_filter_entry_states,
+        )
+        blank_header_filter_checkbox.grid(row=2, column=0, columnspan=2, padx=(12, 8), pady=(6, 14), sticky="w")
 
         disabled_tab = tab_view.tab("未启用标识")
         disabled_tab.grid_columnconfigure(1, weight=1)
 
+        # 未启用标识既可以作用在工作表名称，也可以作用在数据列/数据行。
         disabled_label = ctk.CTkLabel(disabled_tab, text="表格未启用标识", width=130, anchor="w")
         disabled_label.grid(row=0, column=0, padx=(12, 8), pady=8, sticky="w")
         self.disabled_marker_entry = ctk.CTkEntry(disabled_tab, placeholder_text=self.default_disabled_marker)
@@ -215,6 +239,8 @@ class SettingsDialog:
         label_text: str,
         placeholder: str,
     ) -> None:
+        """添加一行启用数据过滤配置输入框，并按 key 保存引用。"""
+
         label = ctk.CTkLabel(parent, text=label_text, width=130, anchor="w")
         label.grid(row=row_index, column=0, padx=(12, 8), pady=6, sticky="w")
         entry = ctk.CTkEntry(parent, placeholder_text=placeholder)
@@ -222,7 +248,14 @@ class SettingsDialog:
         self.data_filter_setting_entries[key] = entry
 
     def _update_data_filter_entry_states(self) -> None:
-        header_state = "normal" if self._get_bool_var_value(self.enable_header_filter_var) else "disabled"
+        """根据复选框开关启用或禁用对应输入框。"""
+
+        header_state = (
+            "normal"
+            if self._get_bool_var_value(self.enable_header_filter_var)
+            or self._get_bool_var_value(self.enable_blank_header_column_filter_var)
+            else "disabled"
+        )
         self._set_data_filter_entry_state("header_row_count", header_state)
 
         column_state = "normal" if self._get_bool_var_value(self.enable_column_filter_var) else "disabled"
@@ -238,11 +271,15 @@ class SettingsDialog:
             self._set_data_filter_entry_state(key, range_row_state)
 
     def _set_data_filter_entry_state(self, key: str, state: str) -> None:
+        """设置单个过滤输入框状态；不存在时静默跳过。"""
+
         entry = self.data_filter_setting_entries.get(key)
         if entry is not None:
             entry.configure(state=state)
 
     def _get_bool_var_value(self, variable: ctk.BooleanVar | None) -> bool:
+        """安全读取 CustomTkinter 布尔变量。"""
+
         return bool(variable.get()) if variable is not None else False
 
     def _fill_entries(
@@ -252,6 +289,8 @@ class SettingsDialog:
         data_filter_config: DataFilterConfig,
         help_url: str,
     ) -> None:
+        """把当前配置值写入窗口输入框。"""
+
         values = {
             "sample_text": reference_config.sample_text,
             "reference_row_index": str(reference_config.reference_row_index),
@@ -290,6 +329,8 @@ class SettingsDialog:
 
         if self.enable_header_filter_var is not None:
             self.enable_header_filter_var.set(data_filter_config.enable_header_filter)
+        if self.enable_blank_header_column_filter_var is not None:
+            self.enable_blank_header_column_filter_var.set(data_filter_config.enable_blank_header_column_filter)
         if self.enable_column_filter_var is not None:
             self.enable_column_filter_var.set(data_filter_config.enable_column_filter)
         if self.enable_disabled_row_filter_var is not None:
@@ -303,6 +344,8 @@ class SettingsDialog:
             self.help_url_entry.insert(0, help_url)
 
     def _save_settings(self) -> None:
+        """读取并校验所有设置，成功后通过回调交给主窗口保存。"""
+
         try:
             data_filter_config = self._read_data_filter_settings_entries()
             validate_data_filter_config(data_filter_config)
@@ -321,6 +364,8 @@ class SettingsDialog:
         self.close()
 
     def _read_reference_settings_entries(self) -> ReferenceLookupConfig:
+        """从引用配置页签读取 ReferenceLookupConfig。"""
+
         def get_entry_value(key: str) -> str:
             entry = self.reference_setting_entries.get(key)
             return entry.get().strip() if entry is not None else ""
@@ -334,6 +379,8 @@ class SettingsDialog:
         )
 
     def _read_data_filter_settings_entries(self) -> DataFilterConfig:
+        """从基础配置和未启用标识页签读取 DataFilterConfig。"""
+
         def get_entry_value(key: str) -> str:
             entry = self.data_filter_setting_entries.get(key)
             return entry.get().strip() if entry is not None else ""
@@ -341,15 +388,17 @@ class SettingsDialog:
         enable_column_filter = self._get_bool_var_value(self.enable_column_filter_var)
         enable_disabled_row_filter = self._get_bool_var_value(self.enable_disabled_row_filter_var)
         enable_header_filter = self._get_bool_var_value(self.enable_header_filter_var)
+        enable_blank_header_column_filter = self._get_bool_var_value(self.enable_blank_header_column_filter_var)
         enable_range_row_filter = self._get_bool_var_value(self.enable_range_row_filter_var)
 
         return DataFilterConfig(
             enable_header_filter=enable_header_filter,
             header_row_count=(
                 parse_positive_int(get_entry_value("header_row_count"), "表头长度")
-                if enable_header_filter
+                if enable_header_filter or enable_blank_header_column_filter
                 else DEFAULT_DATA_FILTER_CONFIG.header_row_count
             ),
+            enable_blank_header_column_filter=enable_blank_header_column_filter,
             enable_column_filter=enable_column_filter,
             column_marker_row_index=(
                 parse_positive_int(get_entry_value("column_marker_row_index"), "列判断行")
@@ -375,22 +424,29 @@ class SettingsDialog:
         )
 
     def _read_disabled_marker_entry(self) -> str:
+        """读取工作表未启用前缀标识。"""
+
         if self.disabled_marker_entry is None:
             return ""
         return self.disabled_marker_entry.get().strip()
 
     def _read_help_url_entry(self) -> str:
+        """读取帮助链接。"""
+
         if self.help_url_entry is None:
             return ""
         return self.help_url_entry.get().strip()
 
     def close(self) -> None:
+        """关闭弹窗并清空控件引用，避免下次复用失效对象。"""
+
         if self.window is not None and self.window.winfo_exists():
             self.window.destroy()
         self.window = None
         self.reference_setting_entries.clear()
         self.data_filter_setting_entries.clear()
         self.enable_header_filter_var = None
+        self.enable_blank_header_column_filter_var = None
         self.enable_column_filter_var = None
         self.enable_disabled_row_filter_var = None
         self.enable_range_row_filter_var = None
@@ -399,6 +455,8 @@ class SettingsDialog:
 
 
 def parse_positive_int(value: object, field_label: str) -> int:
+    """把用户输入解析为正整数，并给出带字段名的错误提示。"""
+
     normalized_value = normalize_number_text(value)
     try:
         decimal_value = Decimal(normalized_value)
@@ -407,6 +465,7 @@ def parse_positive_int(value: object, field_label: str) -> int:
         if digit_match is None:
             current_value = "空" if not normalized_value else normalized_value
             raise ExcelReadError(f"{field_label}必须是数字，当前读取到：{current_value}")
+        # 兼容“第 6 行”这类带文字的输入，只取其中第一段数字。
         number = int(digit_match.group(0))
     else:
         if decimal_value != decimal_value.to_integral_value():
@@ -419,6 +478,8 @@ def parse_positive_int(value: object, field_label: str) -> int:
 
 
 def normalize_number_text(value: object) -> str:
+    """统一全角数字、逗号和不可见字符，降低用户输入格式要求。"""
+
     text = unicodedata.normalize("NFKC", str(value)).strip()
     text = text.replace(",", "").replace("，", "")
     return "".join(char for char in text if not char.isspace() and char not in {"\u200b", "\ufeff"})

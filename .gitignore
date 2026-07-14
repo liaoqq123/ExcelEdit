@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+build/
+assets/
+dist/*.exe
+dist/*.previous.exe
+file_index_cache.json

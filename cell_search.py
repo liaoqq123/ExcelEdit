@@ -1,3 +1,9 @@
+"""Excel 单元格内容检索逻辑。
+
+新版 .xlsx/.xlsm 等文件会直接读取压缩包里的 XML，用“先判断是否可能命中，
+再解析具体位置”的方式减少无效解析；.xls 和 .xlsb 使用对应第三方库兜底。
+"""
+
 from dataclasses import dataclass
 from html import escape
 from io import BytesIO
@@ -31,6 +37,8 @@ ROW_FILTER_MODES = (ROW_FILTER_MODE_NONE, ROW_FILTER_MODE_DISABLED, ROW_FILTER_M
 
 @dataclass(frozen=True)
 class ExcelCellMatch:
+    """单元格检索命中结果，包含打开文件并定位单元格所需的信息。"""
+
     path: Path
     workbook_name: str
     sheet_name: str
@@ -41,8 +49,15 @@ class ExcelCellMatch:
 
 @dataclass(frozen=True)
 class DataFilterConfig:
+    """启用数据过滤配置。
+
+    可跳过表头、排除空白表头列、排除禁用列、排除禁用行，
+    或只保留某个起止标记之间的行。
+    """
+
     enable_header_filter: bool = False
     header_row_count: int = 1
+    enable_blank_header_column_filter: bool = False
     enable_column_filter: bool = False
     column_marker_row_index: int = 1
     disabled_column_marker: str = "$"
@@ -57,6 +72,8 @@ class DataFilterConfig:
 
 @dataclass(frozen=True)
 class DataFilterState:
+    """把过滤配置转换成搜索时可快速判断的集合状态。"""
+
     header_row_count: int = 0
     disabled_columns: frozenset[int] = frozenset()
     disabled_rows: frozenset[int] = frozenset()
@@ -73,12 +90,14 @@ def search_excel_cells(
     data_filter_config: DataFilterConfig | None = None,
     cancel_event: Event | None = None,
 ) -> list[ExcelCellMatch]:
+    """在目录内所有 Excel 文件中搜索单元格缓存值。"""
+
     normalized_keyword = keyword.strip().lower()
     if not normalized_keyword:
         raise ExcelReadError("Search keyword cannot be empty")
 
     matches: list[ExcelCellMatch] = []
-    for path in iter_excel_files(folder_path):
+    for path in iter_excel_files(folder_path, cancel_event=cancel_event):
         if _is_cancelled(cancel_event):
             break
         matches.extend(
@@ -101,6 +120,8 @@ def _search_excel_file_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
+    """根据 Excel 文件格式分发到对应搜索实现。"""
+
     suffix = path.suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
         return _search_xlsx_xml_cells(path, keyword, disabled_sheet_marker, data_filter_config, cancel_event)
@@ -118,11 +139,14 @@ def _search_xlsx_xml_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
+    """直接解析 xlsx 压缩包 XML 来搜索单元格，避免完整加载工作簿。"""
+
     try:
         with zipfile.ZipFile(path) as archive:
             if _is_cancelled(cancel_event):
                 return []
 
+            # 启用数据过滤时后面还要读取列/行标记，所以先完整拿到共享字符串表。
             shared_strings = _read_shared_strings(archive, cancel_event) if data_filter_config is not None else None
             matching_shared_strings = (
                 _filter_matching_shared_strings(shared_strings, keyword, cancel_event)
@@ -163,6 +187,8 @@ def _search_xlsx_xml_cells(
 
 
 def _read_workbook_sheets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
+    """从 workbook.xml 和关系文件中解析工作表名称与 XML 路径。"""
+
     workbook_root = ElementTree.fromstring(archive.read(WORKBOOK_PART_PATH))
     relationships = _read_workbook_relationships(archive)
     sheets: list[tuple[str, str]] = []
@@ -178,6 +204,8 @@ def _read_workbook_sheets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
 
 
 def _read_workbook_relationships(archive: zipfile.ZipFile) -> dict[str, str]:
+    """读取 workbook.xml.rels，把关系 ID 映射到实际工作表 XML 路径。"""
+
     relationships_root = ElementTree.fromstring(archive.read(WORKBOOK_RELS_PART_PATH))
     relationships: dict[str, str] = {}
     for relationship in relationships_root:
@@ -194,6 +222,8 @@ def _read_workbook_relationships(archive: zipfile.ZipFile) -> dict[str, str]:
 
 
 def _read_shared_strings(archive: zipfile.ZipFile, cancel_event: Event | None = None) -> list[str]:
+    """读取 xlsx 共享字符串表，索引位置对应单元格里的 shared string id。"""
+
     try:
         shared_strings_xml = archive.read(SHARED_STRINGS_PART_PATH)
     except KeyError:
@@ -216,6 +246,8 @@ def _filter_matching_shared_strings(
     keyword: str,
     cancel_event: Event | None = None,
 ) -> dict[int, str]:
+    """在已读取的共享字符串表中筛出包含关键词的条目。"""
+
     matches: dict[int, str] = {}
     for shared_string_index, text in enumerate(shared_strings):
         if _is_cancelled(cancel_event):
@@ -230,6 +262,8 @@ def _read_matching_shared_strings(
     keyword: str,
     cancel_event: Event | None = None,
 ) -> dict[int, str]:
+    """只读取命中关键词的共享字符串，用于不需要数据过滤的快速路径。"""
+
     try:
         shared_strings_xml = archive.read(SHARED_STRINGS_PART_PATH)
     except KeyError:
@@ -239,6 +273,7 @@ def _read_matching_shared_strings(
         return {}
 
     normalized_shared_strings_xml = shared_strings_xml.lower()
+    # 先用字节包含判断做粗筛；如果是富文本 <r>，关键词可能跨文本段，仍需解析确认。
     if not _has_direct_keyword_hint(normalized_shared_strings_xml, keyword) and b"<r>" not in normalized_shared_strings_xml:
         return {}
 
@@ -271,6 +306,8 @@ def _search_sheet_xml_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
+    """解析单个工作表 XML，定位真正命中的行、列和值。"""
+
     matches: list[ExcelCellMatch] = []
     current_row_index = 0
     current_column_index = 0
@@ -332,6 +369,8 @@ def _read_sheet_xml_if_search_hint(
     keyword: str,
     cancel_event: Event | None = None,
 ) -> bytes | None:
+    """读取工作表 XML，并在没有任何命中迹象时直接跳过解析。"""
+
     if _is_cancelled(cancel_event):
         return None
 
@@ -351,6 +390,8 @@ def _sheet_xml_has_search_hint(
     matching_shared_string_ids: set[bytes],
     keyword: str,
 ) -> bool:
+    """判断工作表 XML 是否可能包含关键词对应的单元格。"""
+
     if matching_shared_string_ids and _has_matching_shared_string_reference(
         normalized_sheet_xml,
         matching_shared_string_ids,
@@ -372,6 +413,8 @@ def _build_xlsx_data_filter_state(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None = None,
 ) -> DataFilterState | None:
+    """从 xlsx 工作表 XML 中提取启用数据过滤所需的行列标记。"""
+
     if data_filter_config is None:
         return None
 
@@ -381,6 +424,8 @@ def _build_xlsx_data_filter_state(
     range_row_marker_values: dict[int, str] = {}
     marker_row_values: dict[int, str] = {}
     available_row_indices: set[int] = set()
+    available_column_indices: set[int] = set()
+    header_column_values: dict[int, list[str]] = {}
 
     with BytesIO(sheet_xml) as stream:
         for event, element in ElementTree.iterparse(stream, events=("start", "end")):
@@ -400,7 +445,13 @@ def _build_xlsx_data_filter_state(
                 current_column_index,
             )
             available_row_indices.add(row_index)
+            available_column_indices.add(column_index)
             text = _clean_filter_text(_get_xml_cell_text(element, shared_strings))
+            if (
+                data_filter_config.enable_blank_header_column_filter
+                and row_index <= data_filter_config.header_row_count
+            ):
+                header_column_values.setdefault(column_index, []).append(text)
             if (
                 data_filter_config.enable_disabled_row_filter
                 and column_index == data_filter_config.disabled_row_marker_column_index
@@ -421,6 +472,8 @@ def _build_xlsx_data_filter_state(
         marker_row_values,
         data_filter_config,
         available_row_indices,
+        available_column_indices,
+        header_column_values,
     )
 
 
@@ -430,7 +483,11 @@ def _build_data_filter_state(
     marker_row_values: dict[int, str],
     data_filter_config: DataFilterConfig | None,
     available_row_indices: set[int] | None = None,
+    available_column_indices: set[int] | None = None,
+    header_column_values: dict[int, list[str]] | None = None,
 ) -> DataFilterState | None:
+    """把原始标记值转换成可直接判断的禁用列、禁用行和启用行集合。"""
+
     if data_filter_config is None:
         return None
 
@@ -441,6 +498,12 @@ def _build_data_filter_state(
         for column_index, text in marker_row_values.items()
         if data_filter_config.enable_column_filter and marker and text.startswith(marker)
     )
+    blank_header_columns = _get_blank_header_columns(
+        header_column_values or {},
+        available_column_indices or set(),
+        data_filter_config,
+    )
+    disabled_columns = frozenset((*disabled_columns, *blank_header_columns))
 
     disabled_rows: frozenset[int] = frozenset()
     enabled_rows: frozenset[int] | None = None
@@ -463,12 +526,36 @@ def _build_data_filter_state(
     return DataFilterState(header_row_count, disabled_columns, disabled_rows, enabled_rows)
 
 
+def _get_blank_header_columns(
+    header_column_values: dict[int, list[str]],
+    available_column_indices: set[int],
+    data_filter_config: DataFilterConfig,
+) -> frozenset[int]:
+    """找出表头范围内没有任何非空值的列。"""
+
+    if not data_filter_config.enable_blank_header_column_filter:
+        return frozenset()
+
+    header_non_empty_columns = {
+        column_index
+        for column_index, values in header_column_values.items()
+        if any(value.strip() for value in values)
+    }
+    return frozenset(
+        column_index
+        for column_index in available_column_indices
+        if column_index not in header_non_empty_columns
+    )
+
+
 def _get_enabled_range_rows(
     row_marker_values: dict[int, str],
     range_start_text: str,
     range_end_text: str,
     available_row_indices: set[int],
 ) -> frozenset[int]:
+    """根据起始/结束标记计算允许检索的行区间。"""
+
     if not range_start_text or not range_end_text:
         return frozenset()
 
@@ -496,6 +583,8 @@ def _get_enabled_range_rows(
 
 
 def _is_enabled_cell(row_index: int, column_index: int, data_filter_state: DataFilterState | None) -> bool:
+    """判断某个单元格是否通过所有启用数据过滤规则。"""
+
     if data_filter_state is None:
         return True
     if data_filter_state.header_row_count > 0 and row_index <= data_filter_state.header_row_count:
@@ -513,6 +602,8 @@ def _has_matching_shared_string_reference(
     normalized_sheet_xml: bytes,
     matching_shared_string_ids: set[bytes],
 ) -> bool:
+    """检查工作表 XML 是否引用了已命中的共享字符串 ID。"""
+
     for match in SHARED_VALUE_PATTERN.finditer(normalized_sheet_xml):
         if match.group(1) in matching_shared_string_ids:
             return True
@@ -520,6 +611,8 @@ def _has_matching_shared_string_reference(
 
 
 def _has_direct_keyword_hint(normalized_sheet_xml: bytes, keyword: str) -> bool:
+    """检查 XML 字节中是否直接出现关键词或 XML 转义后的关键词。"""
+
     for hint in _direct_keyword_hints(keyword):
         if hint and hint in normalized_sheet_xml:
             return True
@@ -527,6 +620,8 @@ def _has_direct_keyword_hint(normalized_sheet_xml: bytes, keyword: str) -> bool:
 
 
 def _direct_keyword_hints(keyword: str) -> set[bytes]:
+    """生成直接字节搜索时需要尝试的关键词形态。"""
+
     hints = {keyword.encode("utf-8")}
     escaped_keyword = escape(keyword, quote=False).lower()
     hints.add(escaped_keyword.encode("utf-8"))
@@ -538,6 +633,8 @@ def _get_xml_cell_match(
     matching_shared_strings: dict[int, str],
     keyword: str,
 ) -> str | None:
+    """读取 XML 单元格显示值，并判断是否包含关键词。"""
+
     cell_type = element.attrib.get("t", "")
     if cell_type == "s":
         raw_value = _find_child_text(element, "v")
@@ -562,6 +659,8 @@ def _get_xml_cell_match(
 
 
 def _get_xml_cell_text(element: ElementTree.Element, shared_strings: list[str]) -> str:
+    """读取 XML 单元格文本值，用于构建启用数据过滤状态。"""
+
     cell_type = element.attrib.get("t", "")
     if cell_type == "s":
         raw_value = _find_child_text(element, "v")
@@ -590,6 +689,8 @@ def _get_cell_position(
     fallback_row_index: int,
     fallback_column_index: int,
 ) -> tuple[int, int]:
+    """把 A1 这类引用转换成行列号；缺少引用时使用遍历位置兜底。"""
+
     match = CELL_REFERENCE_PATTERN.match(cell_reference)
     if match is None:
         return fallback_row_index, fallback_column_index
@@ -599,6 +700,8 @@ def _get_cell_position(
 
 
 def _column_letters_to_index(column_letters: str) -> int:
+    """把 Excel 列字母转换成 1 起始列号，例如 A=1、AA=27。"""
+
     column_index = 0
     for char in column_letters.upper():
         column_index = column_index * 26 + ord(char) - ord("A") + 1
@@ -606,12 +709,16 @@ def _column_letters_to_index(column_letters: str) -> int:
 
 
 def _resolve_part_path(base_part_path: str, target: str) -> str:
+    """把关系文件中的相对路径解析成压缩包内的规范路径。"""
+
     if target.startswith("/"):
         return target.lstrip("/")
     return posixpath.normpath(posixpath.join(posixpath.dirname(base_part_path), target))
 
 
 def _find_child_text(element: ElementTree.Element, child_name: str) -> str | None:
+    """在 XML 元素的直接子节点中查找指定名称的文本。"""
+
     for child in element:
         if _local_name(child.tag) == child_name:
             return child.text or ""
@@ -619,6 +726,8 @@ def _find_child_text(element: ElementTree.Element, child_name: str) -> str | Non
 
 
 def _rich_text(element: ElementTree.Element) -> str:
+    """拼接富文本单元格中的所有文本段。"""
+
     text_parts: list[str] = []
     for text_element in element.iter():
         if (text_element.tag == TEXT_TAG or _local_name(text_element.tag) == "t") and text_element.text:
@@ -627,14 +736,20 @@ def _rich_text(element: ElementTree.Element) -> str:
 
 
 def _xml_tag(name: str) -> str:
+    """生成带主命名空间的 Excel XML 标签名。"""
+
     return f"{{{MAIN_NAMESPACE}}}{name}"
 
 
 def _local_name(tag: str) -> str:
+    """去掉 XML 命名空间，只保留标签本名。"""
+
     return tag.rsplit("}", 1)[-1]
 
 
 def _parse_int(value: object, default: int) -> int:
+    """安全转换整数，失败时返回默认值。"""
+
     try:
         return int(str(value))
     except (TypeError, ValueError):
@@ -642,18 +757,26 @@ def _parse_int(value: object, default: int) -> int:
 
 
 def _clean_filter_text(value: object) -> str:
+    """清理过滤配置比较时使用的文本。"""
+
     if value is None:
         return ""
     return str(value).strip()
 
 
 def normalize_row_filter_mode(row_filter_mode: str) -> str:
+    """兼容旧缓存中的行过滤模式值。"""
+
     return row_filter_mode if row_filter_mode in ROW_FILTER_MODES else ROW_FILTER_MODE_NONE
 
 
 def validate_data_filter_config(config: DataFilterConfig) -> None:
+    """校验启用数据过滤配置，避免搜索时出现无意义的行列参数。"""
+
     if config.enable_header_filter and config.header_row_count < 1:
         raise ExcelReadError("表头长度必须大于等于 1")
+    if config.enable_blank_header_column_filter and config.header_row_count < 1:
+        raise ExcelReadError("屏蔽空白表头时，表头长度必须大于等于 1")
     if config.enable_column_filter and config.column_marker_row_index < 1:
         raise ExcelReadError("列未启用判断行必须大于等于 1")
     if config.enable_column_filter and not config.disabled_column_marker.strip():
@@ -678,6 +801,8 @@ def _search_xlrd_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
+    """用 xlrd 搜索老格式 .xls 文件。"""
+
     try:
         import xlrd
     except ImportError as exc:
@@ -733,6 +858,8 @@ def _search_xlsb_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
 ) -> list[ExcelCellMatch]:
+    """用 pyxlsb 搜索 .xlsb 文件。"""
+
     try:
         from pyxlsb import open_workbook
     except ImportError as exc:
@@ -784,12 +911,16 @@ def _build_xlrd_data_filter_state(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None = None,
 ) -> DataFilterState | None:
+    """从 xlrd 工作表中提取启用数据过滤状态。"""
+
     if data_filter_config is None:
         return None
 
     disabled_row_marker_values: dict[int, str] = {}
     range_row_marker_values: dict[int, str] = {}
     marker_row_values: dict[int, str] = {}
+    available_column_indices: set[int] = set(range(1, getattr(worksheet, "ncols", 0) + 1))
+    header_column_values: dict[int, list[str]] = {}
     marker_row_offset = data_filter_config.column_marker_row_index - 1
     disabled_row_marker_column_offset = data_filter_config.disabled_row_marker_column_index - 1
     range_row_marker_column_offset = data_filter_config.range_row_marker_column_index - 1
@@ -801,6 +932,16 @@ def _build_xlrd_data_filter_state(
             marker_row_values[column_offset + 1] = _clean_filter_text(
                 worksheet.cell_value(marker_row_offset, column_offset)
             )
+
+    if data_filter_config.enable_blank_header_column_filter:
+        header_rows = min(data_filter_config.header_row_count, getattr(worksheet, "nrows", 0))
+        for row_offset in range(header_rows):
+            if _is_cancelled(cancel_event):
+                return None
+            for column_offset in range(getattr(worksheet, "ncols", 0)):
+                header_column_values.setdefault(column_offset + 1, []).append(
+                    _clean_filter_text(worksheet.cell_value(row_offset, column_offset))
+                )
 
     for row_offset in range(getattr(worksheet, "nrows", 0)):
         if _is_cancelled(cancel_event):
@@ -826,6 +967,8 @@ def _build_xlrd_data_filter_state(
         marker_row_values,
         data_filter_config,
         set(range(1, getattr(worksheet, "nrows", 0) + 1)),
+        available_column_indices,
+        header_column_values,
     )
 
 
@@ -833,6 +976,8 @@ def _build_tabular_data_filter_state(
     rows: list[list[object]],
     data_filter_config: DataFilterConfig | None,
 ) -> DataFilterState | None:
+    """从已加载的二维表格数据中提取启用数据过滤状态。"""
+
     if data_filter_config is None:
         return None
 
@@ -861,29 +1006,49 @@ def _build_tabular_data_filter_state(
             for column_index, value in enumerate(rows[marker_row_index - 1], start=1)
         }
 
+    available_column_indices = {
+        column_index
+        for row in rows
+        for column_index, _value in enumerate(row, start=1)
+    }
+    header_column_values: dict[int, list[str]] = {}
+    if data_filter_config.enable_blank_header_column_filter:
+        for row in rows[: data_filter_config.header_row_count]:
+            for column_index, value in enumerate(row, start=1):
+                header_column_values.setdefault(column_index, []).append(_clean_filter_text(value))
+
     return _build_data_filter_state(
         disabled_row_marker_values,
         range_row_marker_values,
         marker_row_values,
         data_filter_config,
         set(range(1, len(rows) + 1)),
+        available_column_indices,
+        header_column_values,
     )
 
 
 def _should_search_sheet(sheet_name: str, disabled_sheet_marker: str | None) -> bool:
+    """根据工作表名称前缀判断是否跳过未启用工作表。"""
+
     marker = (disabled_sheet_marker or "").strip()
     return not marker or not sheet_name.startswith(marker)
 
 
 def _is_cancelled(cancel_event: Event | None) -> bool:
+    """判断后台单元格搜索是否已取消。"""
+
     return cancel_event is not None and cancel_event.is_set()
 
 
 def _get_matched_text(value: object, keyword: str) -> str | None:
+    """返回包含关键词的最终缓存值；公式文本本身不参与匹配。"""
+
     if value is None:
         return None
 
     text = str(value)
+    # 这里跳过公式表达式本身，搜索的是 Excel 保存后的缓存结果。
     if text.startswith("="):
         return None
 
