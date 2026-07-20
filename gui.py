@@ -4,27 +4,32 @@
 双击打开文件/工作表/单元格，以及在工作表结果中查找引用关系。
 """
 
-import json
 import os
 import subprocess
 import sys
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Thread
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import customtkinter as ctk
 
+from cache_store import read_cache_data as read_shared_cache_data
+from cache_store import update_cache_data as update_shared_cache_data
 from cell_search import (
+    DEFAULT_MAX_SEARCH_RESULTS,
     DEFAULT_DATA_FILTER_CONFIG,
     DataFilterConfig,
     ExcelCellMatch,
+    ExcelCellSearchIssue,
     search_excel_cells,
     validate_data_filter_config,
 )
-from excel_common import ExcelReadError
-from file_search import FileSearchError, FileSearchResult, search_files
+from excel_common import EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError
+from file_search import DEFAULT_MAX_FILE_SEARCH_RESULTS, FileSearchError, FileSearchResult, search_files
 from popup_gui import SettingsDialog, parse_positive_int
 from worksheet_search import (
     DEFAULT_REFERENCE_LOOKUP_CONFIG,
@@ -55,11 +60,11 @@ def get_resource_path(relative_path: str) -> Path:
     return get_app_directory() / relative_path
 
 
-CACHE_FILE = get_app_directory() / "cache_data.json"
 APP_NAME = "奶龙检索大师"
 APP_ICON_RELATIVE_PATH = "assets/nailong_search_master.ico"
 DEFAULT_DISABLED_SHEET_MARKER = "$"
 FOLDER_HISTORY_LIMIT = 20
+EXCEL_OPEN_TIMEOUT_SECONDS = 20
 WORKSHEET_RESULT_COLUMNS = (
     ("workbook", "工作簿", 360, 220, True),
     ("sheet", "工作表", 360, 220, True),
@@ -124,11 +129,55 @@ class ExcelEditApp(ctk.CTk):
         self.help_button: ctk.CTkButton | None = None
         self.cancel_search_button: ctk.CTkButton | None = None
         self.search_cancel_event: Event | None = None
+        self.reference_cancel_events: dict[str, Event] = {}
+        self.result_generation = 0
+        self.opening_targets: set[ResultTarget] = set()
+        self.is_closing = False
+        self.ui_callbacks: Queue[Callable[[], None]] = Queue()
+        self.ui_poll_job: str | None = None
 
         # 先构建控件再加载缓存，因为缓存需要写回输入框和下拉框。
         self._build_layout()
         self._load_cached_inputs()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.ui_poll_job = self.after(50, self._poll_ui_callbacks)
+
+    def _post_to_ui(self, callback: Callable[[], None]) -> None:
+        """后台线程只写入队列，由 Tk 主线程统一执行界面更新。"""
+
+        if not self.is_closing:
+            self.ui_callbacks.put(callback)
+
+    def _poll_ui_callbacks(self) -> None:
+        """在 Tk 主线程轮询后台任务结果，避免跨线程直接调用 Tk。"""
+
+        self.ui_poll_job = None
+        if self.is_closing:
+            return
+
+        while True:
+            try:
+                callback = self.ui_callbacks.get_nowait()
+            except Empty:
+                break
+            try:
+                callback()
+            except Exception as exc:
+                self.report_callback_exception(type(exc), exc, exc.__traceback__)
+            if self.is_closing:
+                return
+
+        self.ui_poll_job = self.after(50, self._poll_ui_callbacks)
+
+    def _post_search_callback(self, cancel_event: Event, callback: Callable[[], None]) -> None:
+        """只接收当前检索任务的结果，丢弃已经取消或过期的回调。"""
+
+        def run_if_current() -> None:
+            if self.is_closing or self.search_cancel_event is not cancel_event:
+                return
+            callback()
+
+        self._post_to_ui(run_if_current)
 
     def _set_app_icon(self) -> None:
         """设置窗口图标；缺少图标时不影响程序启动。"""
@@ -394,7 +443,7 @@ class ExcelEditApp(ctk.CTk):
     def _schedule_action_button_layout(self) -> None:
         """把按钮重排延迟到 Tk 空闲时执行，避免滚动时频繁计算。"""
 
-        if self.action_layout_job is not None:
+        if self.is_closing or self.action_layout_job is not None:
             return
         self.action_layout_job = self.after_idle(self._layout_action_buttons)
 
@@ -420,11 +469,10 @@ class ExcelEditApp(ctk.CTk):
             x, y, width, height = bbox
             button_width = min(104, max(86, width - 12))
             button_height = min(24, max(20, height - 6))
+            button.configure(width=button_width, height=button_height)
             button.place(
                 x=x + max(4, (width - button_width) // 2),
                 y=y + max(3, (height - button_height) // 2),
-                width=button_width,
-                height=button_height,
             )
 
     def choose_folder(self) -> None:
@@ -480,7 +528,7 @@ class ExcelEditApp(ctk.CTk):
         self._rebuild_folder_dropdown_menu(width)
 
     def _open_folder_dropdown_menu(self) -> None:
-        """打开历史下拉菜单前先同步宽度。"""
+        """用带鼠标抓取的弹出方式打开菜单，避免点击穿透到底层控件。"""
 
         self._sync_folder_dropdown_width()
         dropdown_menu = getattr(self.folder_entry, "_dropdown_menu", None)
@@ -489,8 +537,13 @@ class ExcelEditApp(ctk.CTk):
 
         current_height = getattr(self.folder_entry, "_current_height", self.folder_entry.winfo_height())
         y_offset = self.folder_entry._apply_widget_scaling(current_height + 0)
-        dropdown_menu.open(self.folder_entry.winfo_rootx(), self.folder_entry.winfo_rooty() + y_offset)
-        self.folder_entry._close_on_next_click = True
+        platform_offset = dropdown_menu._apply_widget_scaling(3)
+        menu_x = int(self.folder_entry.winfo_rootx())
+        menu_y = int(self.folder_entry.winfo_rooty() + y_offset + platform_offset)
+        self.folder_entry._close_on_next_click = False
+        # CustomTkinter 在 Windows 默认调用 Menu.post()，该方式没有完整的菜单抓取，
+        # 点击菜单项时可能继续触发下方 Treeview。tk_popup() 会在菜单存续期间接管鼠标事件。
+        dropdown_menu.tk_popup(menu_x, menu_y)
 
     def _rebuild_folder_dropdown_menu(self, target_width: int) -> None:
         """重建 CustomTkinter 下拉菜单项，让弹出的历史地址不再过窄。"""
@@ -632,6 +685,7 @@ class ExcelEditApp(ctk.CTk):
         search_scope = "、".join(search_scope_parts)
         scope_text = f"{search_scope}中" if search_scope else ""
         self.status_label.configure(text=f"正在搜索{scope_text}包含“{keyword}”的单元格")
+        self._clear_results()
 
         worker = Thread(
             target=self._search_cells_in_background,
@@ -689,16 +743,21 @@ class ExcelEditApp(ctk.CTk):
         try:
             results = scan_excel_workbooks(folder_path, keyword, cancel_event=cancel_event)
         except ExcelReadError as exc:
+            message = str(exc)
             if cancel_event.is_set():
-                self.after(0, self._search_cancelled)
+                self._post_search_callback(cancel_event, self._search_cancelled)
             else:
-                self.after(0, lambda: self._scan_failed(str(exc)))
+                self._post_search_callback(cancel_event, lambda message=message: self._scan_failed(message))
+            return
+        except Exception as exc:
+            message = f"发生未预期错误：{exc}"
+            self._post_search_callback(cancel_event, lambda message=message: self._scan_failed(message))
             return
 
         if cancel_event.is_set():
-            self.after(0, self._search_cancelled)
+            self._post_search_callback(cancel_event, self._search_cancelled)
             return
-        self.after(0, lambda: self._scan_finished(results))
+        self._post_search_callback(cancel_event, lambda results=results: self._scan_finished(results))
 
     def _search_cells_in_background(
         self,
@@ -710,6 +769,7 @@ class ExcelEditApp(ctk.CTk):
     ) -> None:
         """后台执行单元格检索，并把结果切回主线程渲染。"""
 
+        issues: list[ExcelCellSearchIssue] = []
         try:
             matches = search_excel_cells(
                 folder_path,
@@ -717,18 +777,31 @@ class ExcelEditApp(ctk.CTk):
                 disabled_sheet_marker=disabled_marker,
                 data_filter_config=data_filter_config,
                 cancel_event=cancel_event,
+                issues=issues,
             )
         except ExcelReadError as exc:
+            message = str(exc)
             if cancel_event.is_set():
-                self.after(0, self._search_cancelled)
+                self._post_search_callback(cancel_event, self._search_cancelled)
             else:
-                self.after(0, lambda: self._cell_search_failed(str(exc)))
+                self._post_search_callback(cancel_event, lambda message=message: self._cell_search_failed(message))
+            return
+        except Exception as exc:
+            message = f"发生未预期错误：{exc}"
+            self._post_search_callback(cancel_event, lambda message=message: self._cell_search_failed(message))
             return
 
         if cancel_event.is_set():
-            self.after(0, self._search_cancelled)
+            self._post_search_callback(cancel_event, self._search_cancelled)
             return
-        self.after(0, lambda: self._cell_search_finished(matches, keyword))
+        self._post_search_callback(
+            cancel_event,
+            lambda matches=matches, keyword=keyword, issues=issues: self._cell_search_finished(
+                matches,
+                keyword,
+                issues,
+            ),
+        )
 
     def _search_files_in_background(self, folder_path: Path, keyword: str, cancel_event: Event) -> None:
         """后台执行文件名检索，并把结果切回主线程渲染。"""
@@ -736,16 +809,21 @@ class ExcelEditApp(ctk.CTk):
         try:
             results = search_files(folder_path, keyword, cancel_event=cancel_event)
         except FileSearchError as exc:
+            message = str(exc)
             if cancel_event.is_set():
-                self.after(0, self._search_cancelled)
+                self._post_search_callback(cancel_event, self._search_cancelled)
             else:
-                self.after(0, lambda: self._file_search_failed(str(exc)))
+                self._post_search_callback(cancel_event, lambda message=message: self._file_search_failed(message))
+            return
+        except Exception as exc:
+            message = f"发生未预期错误：{exc}"
+            self._post_search_callback(cancel_event, lambda message=message: self._file_search_failed(message))
             return
 
         if cancel_event.is_set():
-            self.after(0, self._search_cancelled)
+            self._post_search_callback(cancel_event, self._search_cancelled)
             return
-        self.after(0, lambda: self._file_search_finished(results))
+        self._post_search_callback(cancel_event, lambda results=results: self._file_search_finished(results))
 
     def _begin_search(self) -> Event:
         """进入检索中状态，并创建本次检索的取消事件。"""
@@ -805,13 +883,23 @@ class ExcelEditApp(ctk.CTk):
         self.status_label.configure(text="单元格搜索失败")
         messagebox.showerror("单元格搜索失败", message)
 
-    def _cell_search_finished(self, matches: list[ExcelCellMatch], keyword: str) -> None:
+    def _cell_search_finished(
+        self,
+        matches: list[ExcelCellMatch],
+        keyword: str,
+        issues: list[ExcelCellSearchIssue],
+    ) -> None:
         """渲染单元格检索结果并更新状态栏统计。"""
 
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_cell_matches(matches)
-        self.status_label.configure(text=f"单元格搜索完成：找到 {len(matches)} 条匹配")
+        status_parts = [f"找到 {len(matches)} 条匹配"]
+        if len(matches) >= DEFAULT_MAX_SEARCH_RESULTS:
+            status_parts.append(f"已达到显示上限 {DEFAULT_MAX_SEARCH_RESULTS} 条")
+        if issues:
+            status_parts.append(f"跳过 {len(issues)} 个无法读取的文件")
+        self.status_label.configure(text="单元格搜索完成：" + "，".join(status_parts))
 
     def _file_search_failed(self, message: str) -> None:
         """显示文件检索失败信息。"""
@@ -827,7 +915,12 @@ class ExcelEditApp(ctk.CTk):
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_file_results(results)
-        self.status_label.configure(text=f"文件检索完成：找到 {len(results)} 个文件")
+        limit_text = (
+            f"，已达到显示上限 {DEFAULT_MAX_FILE_SEARCH_RESULTS} 个"
+            if len(results) >= DEFAULT_MAX_FILE_SEARCH_RESULTS
+            else ""
+        )
+        self.status_label.configure(text=f"文件检索完成：找到 {len(results)} 个文件{limit_text}")
 
     def _set_search_controls_running(self, is_running: bool) -> None:
         """切换检索中/空闲状态下按钮和选项的可用性。"""
@@ -943,17 +1036,60 @@ class ExcelEditApp(ctk.CTk):
             messagebox.showerror("无法打开", "没有找到对应的文件地址。")
             return
 
+        if target in self.opening_targets:
+            return
+        self.opening_targets.add(target)
+        self.status_label.configure(text=f"正在打开：{target.file_path.name}")
+        worker = Thread(target=self._open_target_in_background, args=(target,), daemon=True)
+        worker.start()
+
+    def _open_target_in_background(self, target: ResultTarget) -> None:
+        """在后台打开目标，避免 Excel COM 或系统关联程序阻塞 Tk 主线程。"""
+
         try:
             if target.open_containing_folder:
                 open_containing_folder(target.file_path)
-                return
-            open_file(target.file_path, target.sheet_name, target.row_index, target.column_index)
+                located = True
+            else:
+                located = open_file(target.file_path, target.sheet_name, target.row_index, target.column_index)
         except (OSError, subprocess.SubprocessError) as exc:
-            messagebox.showerror("打开失败", f"无法打开文件：{target.file_path}\n{exc}")
+            message = str(exc)
+            self._post_to_ui(
+                lambda target=target, message=message: self._open_target_failed(target, message)
+            )
+            return
+        except Exception as exc:
+            message = str(exc)
+            self._post_to_ui(
+                lambda target=target, message=message: self._open_target_failed(target, message)
+            )
+            return
+
+        self._post_to_ui(lambda target=target, located=located: self._open_target_finished(target, located))
+
+    def _open_target_finished(self, target: ResultTarget, located: bool) -> None:
+        """目标打开完成后更新状态。"""
+
+        self.opening_targets.discard(target)
+        if target.sheet_name and not located:
+            self.status_label.configure(text="文件已打开，但未能自动定位到指定工作表或单元格")
+        else:
+            self.status_label.configure(text=f"已打开：{target.file_path.name}")
+
+    def _open_target_failed(self, target: ResultTarget, message: str) -> None:
+        """显示后台打开文件失败信息。"""
+
+        self.opening_targets.discard(target)
+        self.status_label.configure(text="打开失败")
+        messagebox.showerror("打开失败", f"无法打开文件：{target.file_path}\n{message}")
 
     def _clear_results(self) -> None:
         """清空结果列表、行目标映射和悬浮操作按钮。"""
 
+        self.result_generation += 1
+        for cancel_event in self.reference_cancel_events.values():
+            cancel_event.set()
+        self.reference_cancel_events.clear()
         self.item_targets.clear()
         self.reference_items_by_source.clear()
         self.reference_searching_items.clear()
@@ -1007,7 +1143,7 @@ class ExcelEditApp(ctk.CTk):
                         result.workbook_name,
                         sheet_name,
                         get_sheet_enabled_status(sheet_name, self.disabled_sheet_marker),
-                        "查找引用",
+                        "",
                     ),
                 )
                 self.item_targets[item] = ResultTarget(result.path, sheet_name)
@@ -1028,7 +1164,7 @@ class ExcelEditApp(ctk.CTk):
         item_id = self.result_tree.identify_row(event.y)
         if not item_id:
             return "break"
-        if not self._get_action_text(item_id):
+        if not self._action_button_is_available(item_id):
             return "break"
 
         self.result_tree.selection_set(item_id)
@@ -1063,21 +1199,27 @@ class ExcelEditApp(ctk.CTk):
             return
         if item_id in self.reference_searching_items:
             return
-        if not self._get_action_text(item_id):
+        if not self._action_button_is_available(item_id):
             return
 
         button = self.action_buttons.get(item_id)
 
         config = self.reference_config
+        cancel_event = Event()
+        generation = self.result_generation
+        self.reference_cancel_events[item_id] = cancel_event
         self.reference_searching_items.add(item_id)
         if button is not None:
             button.configure(text="查找中...", state="disabled")
-        self._set_action_text(item_id, "查找中...")
         self._remove_reference_rows(item_id)
         self.status_label.configure(text=f"正在查找 {target.sheet_name} 第{config.reference_row_index}行引用")
 
         # 引用查找可能会打开工作簿，所以放到后台避免阻塞界面。
-        worker = Thread(target=self._find_references_in_background, args=(item_id, target, config), daemon=True)
+        worker = Thread(
+            target=self._find_references_in_background,
+            args=(item_id, target, config, generation, cancel_event),
+            daemon=True,
+        )
         worker.start()
 
     def _find_references_in_background(
@@ -1085,25 +1227,78 @@ class ExcelEditApp(ctk.CTk):
         item_id: str,
         target: ResultTarget,
         config: ReferenceLookupConfig,
+        generation: int,
+        cancel_event: Event,
     ) -> None:
         """后台读取引用关系，并切回主线程更新列表。"""
 
+        if cancel_event.is_set() or self.is_closing:
+            return
         try:
-            references = find_sheet_reference_matches(target.file_path, target.sheet_name or "", config)
+            references = find_sheet_reference_matches(
+                target.file_path,
+                target.sheet_name or "",
+                config,
+                cancel_event=cancel_event,
+            )
         except ExcelReadError as exc:
-            self.after(0, lambda: self._references_failed(item_id, str(exc)))
+            message = str(exc)
+            self._post_to_ui(
+                lambda item_id=item_id, message=message, generation=generation, cancel_event=cancel_event: (
+                    self._references_failed(item_id, message, generation, cancel_event)
+                )
+            )
+            return
+        except Exception as exc:
+            message = f"发生未预期错误：{exc}"
+            self._post_to_ui(
+                lambda item_id=item_id, message=message, generation=generation, cancel_event=cancel_event: (
+                    self._references_failed(item_id, message, generation, cancel_event)
+                )
+            )
             return
 
-        self.after(0, lambda: self._references_finished(item_id, target.file_path, references, config))
+        if cancel_event.is_set() or self.is_closing:
+            return
+        self._post_to_ui(
+            lambda item_id=item_id, file_path=target.file_path, references=references, config=config,
+            generation=generation, cancel_event=cancel_event: self._references_finished(
+                item_id,
+                file_path,
+                references,
+                config,
+                generation,
+                cancel_event,
+            )
+        )
 
-    def _references_failed(self, item_id: str, message: str) -> None:
+    def _reference_job_is_current(self, item_id: str, generation: int, cancel_event: Event) -> bool:
+        """判断引用查找结果是否仍对应当前列表中的原始工作表行。"""
+
+        return (
+            not self.is_closing
+            and generation == self.result_generation
+            and self.reference_cancel_events.get(item_id) is cancel_event
+            and not cancel_event.is_set()
+            and self.result_tree.exists(item_id)
+        )
+
+    def _references_failed(
+        self,
+        item_id: str,
+        message: str,
+        generation: int,
+        cancel_event: Event,
+    ) -> None:
         """引用查找失败时恢复按钮状态并显示错误。"""
 
+        if not self._reference_job_is_current(item_id, generation, cancel_event):
+            return
+        self.reference_cancel_events.pop(item_id, None)
         self.reference_searching_items.discard(item_id)
         button = self.action_buttons.get(item_id)
         if button is not None:
             button.configure(text="查找引用", state="normal")
-        self._set_action_text(item_id, "查找引用")
         self.status_label.configure(text=f"查找引用失败：{message}")
 
     def _references_finished(
@@ -1112,14 +1307,18 @@ class ExcelEditApp(ctk.CTk):
         file_path: Path,
         references: list[ExcelSheetReference],
         config: ReferenceLookupConfig,
+        generation: int,
+        cancel_event: Event,
     ) -> None:
         """把查找到的引用表插入到源工作表行下方。"""
 
+        if not self._reference_job_is_current(item_id, generation, cancel_event):
+            return
+        self.reference_cancel_events.pop(item_id, None)
         self.reference_searching_items.discard(item_id)
         button = self.action_buttons.get(item_id)
         if button is not None:
             button.configure(text="查找引用", state="normal")
-        self._set_action_text(item_id, "查找引用")
         self.status_label.configure(
             text=f"找到 {len(references)} 个引用" if references else f"第{config.reference_row_index}行未找到引用"
         )
@@ -1176,30 +1375,16 @@ class ExcelEditApp(ctk.CTk):
                 self.result_tree.delete(item_id)
         self._schedule_action_button_layout()
 
-    def _set_action_text(self, item_id: str, text: str) -> None:
-        """更新 Treeview 数据里的操作列文本，用于控制按钮是否可点击。"""
+    def _action_button_is_available(self, item_id: str) -> bool:
+        """判断工作表行对应的查找引用按钮当前是否可用。"""
 
-        if "action" not in self.current_result_columns or not self.result_tree.exists(item_id):
-            return
-
-        action_index = self.current_result_columns.index("action")
-        values = list(self.result_tree.item(item_id, "values"))
-        if action_index >= len(values):
-            return
-        values[action_index] = text
-        self.result_tree.item(item_id, values=values)
-
-    def _get_action_text(self, item_id: str) -> str:
-        """读取某行操作列文本。"""
-
-        if "action" not in self.current_result_columns or not self.result_tree.exists(item_id):
-            return ""
-
-        action_index = self.current_result_columns.index("action")
-        values = list(self.result_tree.item(item_id, "values"))
-        if action_index >= len(values):
-            return ""
-        return str(values[action_index]).strip()
+        button = self.action_buttons.get(item_id)
+        return (
+            button is not None
+            and self.result_tree.exists(item_id)
+            and item_id not in self.reference_searching_items
+            and str(button.cget("state")) != "disabled"
+        )
 
     def _refresh_sheet_statuses(self) -> None:
         """设置修改后刷新当前工作表列表里的启用/未启用状态。"""
@@ -1309,7 +1494,7 @@ class ExcelEditApp(ctk.CTk):
         if folder_path and Path(folder_path).is_dir():
             self._remember_folder_path(folder_path)
 
-        save_cache_data(
+        cache_saved = save_cache_data(
             {
                 "folder_path": folder_path,
                 "folder_history": self.folder_history,
@@ -1322,12 +1507,26 @@ class ExcelEditApp(ctk.CTk):
                 "only_enabled_data": self.only_enabled_data_var.get(),
             }
         )
+        if not cache_saved and not self.is_closing:
+            self.status_label.configure(text="缓存保存失败，请检查当前用户目录权限")
 
     def close_app(self) -> None:
         """关闭应用前请求取消后台检索并保存当前输入。"""
 
+        if self.is_closing:
+            return
+        self.is_closing = True
         if self.search_cancel_event is not None:
             self.search_cancel_event.set()
+        for cancel_event in self.reference_cancel_events.values():
+            cancel_event.set()
+        self.reference_cancel_events.clear()
+        if self.ui_poll_job is not None:
+            try:
+                self.after_cancel(self.ui_poll_job)
+            except Exception:
+                pass
+            self.ui_poll_job = None
         self._save_cache_from_inputs()
         self.destroy()
 
@@ -1362,18 +1561,10 @@ def load_cache_data() -> dict[str, object]:
 def read_cache_file() -> dict[str, object]:
     """读取原始 JSON 缓存文件，读取失败时返回空字典。"""
 
-    try:
-        raw_data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-    if not isinstance(raw_data, dict):
-        return {}
-
-    return raw_data
+    return read_shared_cache_data()
 
 
-def save_cache_data(cache_data: dict[str, object]) -> None:
+def save_cache_data(cache_data: dict[str, object]) -> bool:
     """保存缓存数据，同时保留工作表名称缓存等其他键。"""
 
     reference_config = cache_data.get("reference_config", DEFAULT_REFERENCE_LOOKUP_CONFIG)
@@ -1383,8 +1574,7 @@ def save_cache_data(cache_data: dict[str, object]) -> None:
     if not isinstance(data_filter_config, DataFilterConfig):
         data_filter_config = DEFAULT_DATA_FILTER_CONFIG
 
-    payload = read_cache_file()
-    payload.update({
+    updates: dict[str, object] = {
         "folder_path": str(cache_data.get("folder_path", "")),
         "folder_history": normalize_folder_history(cache_data.get("folder_history")),
         "keyword": str(cache_data.get("keyword", "")),
@@ -1394,18 +1584,11 @@ def save_cache_data(cache_data: dict[str, object]) -> None:
         "help_url": str(cache_data.get("help_url", "")),
         "only_enabled_sheets": bool(cache_data.get("only_enabled_sheets", False)),
         "only_enabled_data": bool(cache_data.get("only_enabled_data", False)),
-    })
-    # 工作表名称缓存由 worksheet_search 写入同一个文件，这里保存 UI 缓存时不能覆盖它。
-    worksheet_sheet_cache = cache_data.get(WORKSHEET_SHEET_CACHE_KEY, payload.get(WORKSHEET_SHEET_CACHE_KEY, {}))
+    }
+    worksheet_sheet_cache = cache_data.get(WORKSHEET_SHEET_CACHE_KEY)
     if isinstance(worksheet_sheet_cache, dict):
-        payload[WORKSHEET_SHEET_CACHE_KEY] = worksheet_sheet_cache
-    try:
-        CACHE_FILE.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+        updates[WORKSHEET_SHEET_CACHE_KEY] = worksheet_sheet_cache
+    return update_shared_cache_data(updates)
 
 
 def normalize_folder_history(raw_history: object, current_folder: str = "") -> list[str]:
@@ -1445,12 +1628,14 @@ def load_reference_config(raw_config: object) -> ReferenceLookupConfig:
             reference_row_index=parse_positive_int(
                 raw_config.get("reference_row_index", DEFAULT_REFERENCE_LOOKUP_CONFIG.reference_row_index),
                 "引用行",
+                EXCEL_MAX_ROWS,
             ),
             table_name=str(raw_config.get("table_name", DEFAULT_REFERENCE_LOOKUP_CONFIG.table_name)),
             field_name=str(raw_config.get("field_name", DEFAULT_REFERENCE_LOOKUP_CONFIG.field_name)),
             field_row_index=parse_positive_int(
                 raw_config.get("field_row_index", DEFAULT_REFERENCE_LOOKUP_CONFIG.field_row_index),
                 "引用字段行",
+                EXCEL_MAX_ROWS,
             ),
         )
         validate_reference_lookup_config(config)
@@ -1480,6 +1665,7 @@ def load_data_filter_config(raw_config: object) -> DataFilterConfig:
                     DEFAULT_DATA_FILTER_CONFIG.header_row_count,
                 ),
                 "表头长度",
+                EXCEL_MAX_ROWS,
             ),
             enable_blank_header_column_filter=bool(
                 raw_config.get("enable_blank_header_column_filter", False)
@@ -1491,6 +1677,7 @@ def load_data_filter_config(raw_config: object) -> DataFilterConfig:
                     DEFAULT_DATA_FILTER_CONFIG.column_marker_row_index,
                 ),
                 "列判断行",
+                EXCEL_MAX_ROWS,
             ),
             disabled_column_marker=str(
                 raw_config.get(
@@ -1510,6 +1697,7 @@ def load_data_filter_config(raw_config: object) -> DataFilterConfig:
                     old_row_marker_column_index,
                 ),
                 "行禁用判断列",
+                EXCEL_MAX_COLUMNS,
             ),
             disabled_row_contains=str(raw_config.get("disabled_row_contains", "")),
             enable_range_row_filter=bool(
@@ -1524,6 +1712,7 @@ def load_data_filter_config(raw_config: object) -> DataFilterConfig:
                     old_row_marker_column_index,
                 ),
                 "行区间判断列",
+                EXCEL_MAX_COLUMNS,
             ),
             range_start_text=str(raw_config.get("range_start_text", "")),
             range_end_text=str(raw_config.get("range_end_text", "")),
@@ -1713,6 +1902,7 @@ $excel.WindowState = -4137
         capture_output=True,
         text=True,
         creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=EXCEL_OPEN_TIMEOUT_SECONDS,
     )
 
 

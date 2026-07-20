@@ -10,6 +10,9 @@ from pathlib import Path
 from threading import Event
 
 
+DEFAULT_MAX_FILE_SEARCH_RESULTS = 20_000
+
+
 @dataclass(frozen=True)
 class FileSearchResult:
     """文件检索结果，供界面列表直接展示和双击打开目录。"""
@@ -25,7 +28,12 @@ class FileSearchError(RuntimeError):
     pass
 
 
-def search_files(folder_path: str | Path, keyword: str = "", cancel_event: Event | None = None) -> list[FileSearchResult]:
+def search_files(
+    folder_path: str | Path,
+    keyword: str = "",
+    cancel_event: Event | None = None,
+    max_results: int | None = DEFAULT_MAX_FILE_SEARCH_RESULTS,
+) -> list[FileSearchResult]:
     """递归检索文件名和文件地址，关键词为空时返回全部文件。"""
 
     folder = _validate_folder(folder_path)
@@ -40,6 +48,8 @@ def search_files(folder_path: str | Path, keyword: str = "", cancel_event: Event
         if normalized_keyword and not _matches_keyword(file_name, file_address, normalized_keyword):
             continue
         results.append(FileSearchResult(path=file_path, file_name=file_name, file_address=file_address))
+        if max_results is not None and len(results) >= max_results:
+            break
 
     results.sort(key=lambda result: result.file_address.lower())
     return results

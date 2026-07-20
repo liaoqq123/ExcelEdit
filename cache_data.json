@@ -1,6 +1,6 @@
 {
-  "folder_path": "D:\\xy\\data\\dev",
-  "keyword": "GoldHand",
+  "folder_path": "D:/xy/assets_k/resTemp",
+  "keyword": "btn_gjjl",
   "reference_config": {
     "sample_text": "FOREIGN:BBB.Id",
     "reference_row_index": 6,
@@ -10,9 +10,9 @@
   },
   "disabled_sheet_marker": "$",
   "data_filter_config": {
-    "enable_header_filter": true,
-    "header_row_count": 6,
-    "enable_blank_header_column_filter": true,
+    "enable_header_filter": false,
+    "header_row_count": 1,
+    "enable_blank_header_column_filter": false,
     "enable_column_filter": true,
     "column_marker_row_index": 3,
     "disabled_column_marker": "$",
@@ -270,8 +270,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\ActivityConfig.xlsx": {
-      "size": 309565,
-      "mtime_ns": 1783913396561142700,
+      "size": 309452,
+      "mtime_ns": 1784001390615558700,
       "sheet_names": [
         "$备注",
         "正式开服",
@@ -1160,8 +1160,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\ActivityTranslate.xlsx": {
-      "size": 357339,
-      "mtime_ns": 1783929178225260600,
+      "size": 357346,
+      "mtime_ns": 1783935882141830800,
       "sheet_names": [
         "$备注",
         "Sheet1",
@@ -1665,8 +1665,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\EnemyConfig.xlsx": {
-      "size": 39589,
-      "mtime_ns": 1783320193781061900,
+      "size": 39138,
+      "mtime_ns": 1784000636687771900,
       "sheet_names": [
         "怪物",
         "召唤物"
@@ -2042,8 +2042,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\HeroBase.xlsx": {
-      "size": 120869,
-      "mtime_ns": 1783507789223529000,
+      "size": 121007,
+      "mtime_ns": 1783943173751622200,
       "sheet_names": [
         "武将表",
         "$$",
@@ -2470,8 +2470,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\MALL.xlsx": {
-      "size": 276757,
-      "mtime_ns": 1783588039027955900,
+      "size": 276923,
+      "mtime_ns": 1783935885319020400,
       "sheet_names": [
         "充值钻石经费",
         "周月卡特权",
@@ -2753,8 +2753,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\NormalEnemy.xlsx": {
-      "size": 244210,
-      "mtime_ns": 1783320195076591700,
+      "size": 243813,
+      "mtime_ns": 1783943173754930600,
       "sheet_names": [
         "怪物"
       ]
@@ -3309,8 +3309,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\SpineConfig.xlsx": {
-      "size": 62320,
-      "mtime_ns": 1783913420416570600,
+      "size": 62338,
+      "mtime_ns": 1784000636690382100,
       "sheet_names": [
         "$英雄",
         "$备注",
@@ -3532,8 +3532,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateItem.xlsx": {
-      "size": 250639,
-      "mtime_ns": 1783932008096070700,
+      "size": 250545,
+      "mtime_ns": 1783935918174784500,
       "sheet_names": [
         "$备注",
         "埼玉藏品",
@@ -3553,8 +3553,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateMall.xlsx": {
-      "size": 15453,
-      "mtime_ns": 1783588096291170100,
+      "size": 15454,
+      "mtime_ns": 1783936032513228100,
       "sheet_names": [
         "$备注",
         "礼包"
@@ -3569,8 +3569,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateUi.xlsx": {
-      "size": 1448263,
-      "mtime_ns": 1783932001235642500,
+      "size": 1451592,
+      "mtime_ns": 1784000636695396000,
       "sheet_names": [
         "$备注",
         "界面文字",
@@ -3607,8 +3607,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\TranslateUiPrefab.xlsx": {
-      "size": 47034,
-      "mtime_ns": 1783671900593743400,
+      "size": 47025,
+      "mtime_ns": 1783936040820246900,
       "sheet_names": [
         "prefab文本"
       ]
@@ -3831,8 +3831,8 @@
       ]
     },
     "D:\\xy\\data\\dev\\UnlockSystem.xlsx": {
-      "size": 42981,
-      "mtime_ns": 1783655393422921800,
+      "size": 42761,
+      "mtime_ns": 1784008375312534100,
       "sheet_names": [
         "UnlockSystem",
         "$"
@@ -3869,7 +3869,7 @@
     }
   },
   "folder_history": [
-    "D:\\xy\\data\\dev",
-    "D:/xy/assets_k/resTemp"
+    "D:/xy/assets_k/resTemp",
+    "D:\\xy\\data\\dev"
   ]
 }

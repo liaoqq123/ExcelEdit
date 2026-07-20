@@ -26,8 +26,11 @@ ExcelEdit 是一个用于批量检索本地文件和 Excel 文件的桌面工具
 - 在选定文件夹内搜索所有 Excel 单元格内容。
 - 结果展示匹配数据所在的工作簿、工作表、行、列和单元格内容。
 - 双击匹配结果可打开对应工作簿、切换到指定工作表，并选中对应单元格。
-- `.xlsx/.xlsm/.xltx/.xltm` 使用 XML 方式检索，先命中关键词再定位单元格位置。
+- `.xlsx/.xlsm/.xltx/.xltm` 会先快速预筛 XML，命中后再流式定位单元格位置。
 - 公式单元格检索的是 Excel 已保存的缓存结果，不检索公式文本本身。
+- 日期、百分比和常见数字格式可按 Excel 中显示的内容检索。
+- 单个损坏或无法读取的 Excel 会被跳过，不会中断其他文件的检索。
+- 为避免结果过多导致界面失去响应，单元格和文件检索最多展示 20000 条结果。
 - 检索过程中可点击红色“取消”按钮停止当前检索。
 
 ### 引用表查找
@@ -55,7 +58,8 @@ ExcelEdit 是一个用于批量检索本地文件和 Excel 文件的桌面工具
 - 文件夹地址输入框支持下拉选择历史地址，最多保留最近 20 条。
 - 工作表名称检索会缓存工作簿的工作表列表，并通过文件大小和修改时间判断缓存是否仍可使用。
 - Excel 文件发生变化后，对应缓存会自动失效并重新读取。
-- 缓存文件为程序目录下的 `cache_data.json`。
+- 缓存文件保存在当前用户的 `%LOCALAPPDATA%\NailongSearchMaster\cache_data.json`。
+- 旧版本程序目录中的 `cache_data.json` 会在首次运行时自动迁移读取。
 
 ## 支持的 Excel 类型
 
@@ -121,7 +125,7 @@ dist\奶龙检索大师.exe
 如果使用源码运行，需要 Python 3.10 或更高版本，并安装依赖：
 
 ```powershell
-pip install customtkinter openpyxl xlsxwriter xlrd pyxlsb
+pip install -r requirements.txt
 python main.py
 ```
 

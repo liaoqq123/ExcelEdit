@@ -4,16 +4,16 @@
 工作表名称会按文件大小和修改时间缓存，减少重复打开 Excel 的成本。
 """
 
-import json
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
 
 from openpyxl import load_workbook
 
+from cache_store import get_app_directory, read_cache_data, update_cache_data
 from excel_common import (
+    EXCEL_MAX_ROWS,
     ExcelReadError,
     clean_cell_text,
     get_sheet_names,
@@ -56,12 +56,7 @@ class ExcelSheetReference:
 
 
 DEFAULT_REFERENCE_LOOKUP_CONFIG = ReferenceLookupConfig()
-APP_CACHE_FILE = (
-    Path(sys.executable).resolve().parent
-    if getattr(sys, "frozen", False)
-    else Path(__file__).resolve().parent
-) / "cache_data.json"
-LEGACY_SHEET_NAME_CACHE_FILE = APP_CACHE_FILE.with_name("worksheet_sheet_cache.json")
+LEGACY_SHEET_NAME_CACHE_FILE = get_app_directory() / "worksheet_sheet_cache.json"
 WORKSHEET_SHEET_CACHE_KEY = "worksheet_sheet_cache"
 _sheet_name_cache: dict[str, dict[str, object]] | None = None
 _sheet_name_cache_dirty = False
@@ -204,14 +199,7 @@ def _load_sheet_name_cache_unlocked() -> dict[str, dict[str, object]]:
     if _sheet_name_cache is not None:
         return _sheet_name_cache
 
-    try:
-        raw_data = json.loads(APP_CACHE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        legacy_cache = _load_legacy_sheet_name_cache()
-        if legacy_cache:
-            _sheet_name_cache_dirty = True
-        _sheet_name_cache = legacy_cache
-        return _sheet_name_cache
+    raw_data = read_cache_data()
 
     if not isinstance(raw_data, dict):
         _sheet_name_cache = {}
@@ -237,6 +225,8 @@ def _load_legacy_sheet_name_cache() -> dict[str, dict[str, object]]:
     """兼容旧版本单独的 worksheet_sheet_cache.json 缓存文件。"""
 
     try:
+        import json
+
         raw_cache = json.loads(LEGACY_SHEET_NAME_CACHE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
@@ -281,21 +271,9 @@ def _flush_sheet_name_cache() -> None:
         cache_payload = dict(_sheet_name_cache)
         _sheet_name_cache_dirty = False
 
-    try:
-        try:
-            raw_data = json.loads(APP_CACHE_FILE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw_data = {}
-        if not isinstance(raw_data, dict):
-            raw_data = {}
-
-        raw_data[WORKSHEET_SHEET_CACHE_KEY] = cache_payload
-        APP_CACHE_FILE.write_text(
-            json.dumps(raw_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    if not update_cache_data({WORKSHEET_SHEET_CACHE_KEY: cache_payload}):
+        with _sheet_name_cache_lock:
+            _sheet_name_cache_dirty = True
 
 
 def find_sheet_references(
@@ -318,6 +296,7 @@ def find_sheet_reference_matches(
     file_path: str | Path,
     sheet_name: str,
     config: ReferenceLookupConfig | None = None,
+    cancel_event: Event | None = None,
 ) -> list[ExcelSheetReference]:
     """按照配置解析指定工作表引用行里的所有引用关系。"""
 
@@ -329,11 +308,11 @@ def find_sheet_reference_matches(
 
     suffix = path.suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        return _find_openpyxl_sheet_reference_matches(path, sheet_name, lookup_config)
+        return _find_openpyxl_sheet_reference_matches(path, sheet_name, lookup_config, cancel_event)
     if suffix == ".xls":
-        return _find_xlrd_sheet_reference_matches(path, sheet_name, lookup_config)
+        return _find_xlrd_sheet_reference_matches(path, sheet_name, lookup_config, cancel_event)
     if suffix == ".xlsb":
-        return _find_xlsb_sheet_reference_matches(path, sheet_name, lookup_config)
+        return _find_xlsb_sheet_reference_matches(path, sheet_name, lookup_config, cancel_event)
 
     raise ExcelReadError(f"Unsupported Excel file type: {path.suffix}")
 
@@ -341,6 +320,10 @@ def find_sheet_reference_matches(
 def validate_reference_lookup_config(config: ReferenceLookupConfig) -> None:
     """通过构建正则表达式来验证引用配置是否完整、可解析。"""
 
+    if config.reference_row_index > EXCEL_MAX_ROWS:
+        raise ExcelReadError(f"引用行不能大于 {EXCEL_MAX_ROWS}")
+    if config.field_row_index > EXCEL_MAX_ROWS:
+        raise ExcelReadError(f"引用字段行不能大于 {EXCEL_MAX_ROWS}")
     _build_reference_pattern(config)
 
 
@@ -348,6 +331,7 @@ def _find_openpyxl_sheet_reference_matches(
     path: Path,
     sheet_name: str,
     config: ReferenceLookupConfig,
+    cancel_event: Event | None,
 ) -> list[ExcelSheetReference]:
     """读取 xlsx/xlsm 等 openpyxl 支持格式的引用关系。"""
 
@@ -357,6 +341,8 @@ def _find_openpyxl_sheet_reference_matches(
         raise ExcelReadError(f"Could not open Excel file: {path}") from exc
 
     try:
+        if _is_cancelled(cancel_event):
+            return []
         if sheet_name not in workbook.sheetnames:
             raise ExcelReadError(f"Sheet does not exist: {sheet_name}")
 
@@ -369,6 +355,8 @@ def _find_openpyxl_sheet_reference_matches(
             max_row=config.reference_row_index,
         ):
             for column_index, cell in enumerate(row, start=1):
+                if _is_cancelled(cancel_event):
+                    return references
                 _add_unique_reference_matches(
                     references,
                     cell.value,
@@ -384,6 +372,7 @@ def _find_xlrd_sheet_reference_matches(
     path: Path,
     sheet_name: str,
     config: ReferenceLookupConfig,
+    cancel_event: Event | None,
 ) -> list[ExcelSheetReference]:
     """读取老格式 .xls 文件的引用关系。"""
 
@@ -411,6 +400,8 @@ def _find_xlrd_sheet_reference_matches(
         pattern = _build_reference_pattern(config)
         source_fields = _get_xlrd_row_values(worksheet, config.field_row_index)
         for column_offset in range(worksheet.ncols):
+            if _is_cancelled(cancel_event):
+                return references
             _add_unique_reference_matches(
                 references,
                 worksheet.cell_value(row_offset, column_offset),
@@ -426,6 +417,7 @@ def _find_xlsb_sheet_reference_matches(
     path: Path,
     sheet_name: str,
     config: ReferenceLookupConfig,
+    cancel_event: Event | None,
 ) -> list[ExcelSheetReference]:
     """读取 .xlsb 文件的引用关系，只遍历配置里需要的行。"""
 
@@ -446,6 +438,8 @@ def _find_xlsb_sheet_reference_matches(
             last_needed_row = max(config.reference_row_index, config.field_row_index)
             with workbook.get_sheet(sheet_name) as worksheet:
                 for current_row_index, row in enumerate(worksheet.rows(), start=1):
+                    if _is_cancelled(cancel_event):
+                        return references
                     if current_row_index == config.field_row_index:
                         for column_index, cell in enumerate(row, start=1):
                             source_fields[column_index] = clean_cell_text(cell.v)

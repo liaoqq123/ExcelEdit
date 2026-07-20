@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+.idea/
 build/
-assets/
-dist/*.exe
-dist/*.previous.exe
+dist/
+cache_data.json
+worksheet_sheet_cache.json
 file_index_cache.json

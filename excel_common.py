@@ -16,6 +16,8 @@ from xlsxwriter import Workbook
 
 
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".xlsb"}
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLUMNS = 16_384
 
 
 class ExcelReadError(RuntimeError):

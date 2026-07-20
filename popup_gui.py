@@ -16,7 +16,7 @@ from cell_search import (
     DataFilterConfig,
     validate_data_filter_config,
 )
-from excel_common import ExcelReadError
+from excel_common import EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError
 from worksheet_search import ReferenceLookupConfig, validate_reference_lookup_config
 
 
@@ -372,10 +372,18 @@ class SettingsDialog:
 
         return ReferenceLookupConfig(
             sample_text=get_entry_value("sample_text"),
-            reference_row_index=parse_positive_int(get_entry_value("reference_row_index"), "引用行"),
+            reference_row_index=parse_positive_int(
+                get_entry_value("reference_row_index"),
+                "引用行",
+                EXCEL_MAX_ROWS,
+            ),
             table_name=get_entry_value("table_name"),
             field_name=get_entry_value("field_name"),
-            field_row_index=parse_positive_int(get_entry_value("field_row_index"), "引用字段行"),
+            field_row_index=parse_positive_int(
+                get_entry_value("field_row_index"),
+                "引用字段行",
+                EXCEL_MAX_ROWS,
+            ),
         )
 
     def _read_data_filter_settings_entries(self) -> DataFilterConfig:
@@ -394,28 +402,36 @@ class SettingsDialog:
         return DataFilterConfig(
             enable_header_filter=enable_header_filter,
             header_row_count=(
-                parse_positive_int(get_entry_value("header_row_count"), "表头长度")
+                parse_positive_int(get_entry_value("header_row_count"), "表头长度", EXCEL_MAX_ROWS)
                 if enable_header_filter or enable_blank_header_column_filter
                 else DEFAULT_DATA_FILTER_CONFIG.header_row_count
             ),
             enable_blank_header_column_filter=enable_blank_header_column_filter,
             enable_column_filter=enable_column_filter,
             column_marker_row_index=(
-                parse_positive_int(get_entry_value("column_marker_row_index"), "列判断行")
+                parse_positive_int(get_entry_value("column_marker_row_index"), "列判断行", EXCEL_MAX_ROWS)
                 if enable_column_filter
                 else DEFAULT_DATA_FILTER_CONFIG.column_marker_row_index
             ),
             disabled_column_marker=get_entry_value("disabled_column_marker"),
             enable_disabled_row_filter=enable_disabled_row_filter,
             disabled_row_marker_column_index=(
-                parse_positive_int(get_entry_value("disabled_row_marker_column_index"), "行禁用判断列")
+                parse_positive_int(
+                    get_entry_value("disabled_row_marker_column_index"),
+                    "行禁用判断列",
+                    EXCEL_MAX_COLUMNS,
+                )
                 if enable_disabled_row_filter
                 else DEFAULT_DATA_FILTER_CONFIG.disabled_row_marker_column_index
             ),
             disabled_row_contains=get_entry_value("disabled_row_contains"),
             enable_range_row_filter=enable_range_row_filter,
             range_row_marker_column_index=(
-                parse_positive_int(get_entry_value("range_row_marker_column_index"), "行区间判断列")
+                parse_positive_int(
+                    get_entry_value("range_row_marker_column_index"),
+                    "行区间判断列",
+                    EXCEL_MAX_COLUMNS,
+                )
                 if enable_range_row_filter
                 else DEFAULT_DATA_FILTER_CONFIG.range_row_marker_column_index
             ),
@@ -454,27 +470,26 @@ class SettingsDialog:
         self.help_url_entry = None
 
 
-def parse_positive_int(value: object, field_label: str) -> int:
+def parse_positive_int(value: object, field_label: str, maximum: int | None = None) -> int:
     """把用户输入解析为正整数，并给出带字段名的错误提示。"""
 
     normalized_value = normalize_number_text(value)
     try:
         decimal_value = Decimal(normalized_value)
     except (InvalidOperation, ValueError):
-        digit_match = re.search(r"\d+", normalized_value)
-        if digit_match is None:
+        decorated_match = re.fullmatch(r"(?:第)?([+-]?\d+)(?:行|列)?", normalized_value)
+        if decorated_match is None:
             current_value = "空" if not normalized_value else normalized_value
-            raise ExcelReadError(f"{field_label}必须是数字，当前读取到：{current_value}")
-        # 兼容“第 6 行”这类带文字的输入，只取其中第一段数字。
-        number = int(digit_match.group(0))
-    else:
-        if decimal_value != decimal_value.to_integral_value():
-            raise ExcelReadError(f"{field_label}必须是数字，当前读取到：{normalized_value}")
-        number = int(decimal_value)
+            raise ExcelReadError(f"{field_label}必须是正整数，当前读取到：{current_value}")
+        decimal_value = Decimal(decorated_match.group(1))
 
-    if number < 1:
+    if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+        raise ExcelReadError(f"{field_label}必须是正整数，当前读取到：{normalized_value}")
+    if decimal_value < 1:
         raise ExcelReadError(f"{field_label}必须大于等于 1")
-    return number
+    if maximum is not None and decimal_value > maximum:
+        raise ExcelReadError(f"{field_label}不能大于 {maximum}")
+    return int(decimal_value)
 
 
 def normalize_number_text(value: object) -> str:
