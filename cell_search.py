@@ -120,6 +120,7 @@ def search_excel_cells(
     cancel_event: Event | None = None,
     issues: list[ExcelCellSearchIssue] | None = None,
     max_results: int | None = DEFAULT_MAX_SEARCH_RESULTS,
+    exact_match: bool = False,
 ) -> list[ExcelCellMatch]:
     """在目录内所有 Excel 文件中搜索单元格缓存值。"""
 
@@ -142,6 +143,7 @@ def search_excel_cells(
                 data_filter_config,
                 cancel_event,
                 remaining_results,
+                exact_match,
             )
         except ExcelReadError as exc:
             if issues is not None:
@@ -159,6 +161,7 @@ def _search_excel_file_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
     max_results: int | None,
+    exact_match: bool,
 ) -> list[ExcelCellMatch]:
     """根据 Excel 文件格式分发到对应搜索实现。"""
 
@@ -171,11 +174,28 @@ def _search_excel_file_cells(
             data_filter_config,
             cancel_event,
             max_results,
+            exact_match,
         )
     if suffix == ".xls":
-        return _search_xlrd_cells(path, keyword, disabled_sheet_marker, data_filter_config, cancel_event, max_results)
+        return _search_xlrd_cells(
+            path,
+            keyword,
+            disabled_sheet_marker,
+            data_filter_config,
+            cancel_event,
+            max_results,
+            exact_match,
+        )
     if suffix == ".xlsb":
-        return _search_xlsb_cells(path, keyword, disabled_sheet_marker, data_filter_config, cancel_event, max_results)
+        return _search_xlsb_cells(
+            path,
+            keyword,
+            disabled_sheet_marker,
+            data_filter_config,
+            cancel_event,
+            max_results,
+            exact_match,
+        )
     return []
 
 
@@ -186,6 +206,7 @@ def _search_xlsx_xml_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
     max_results: int | None,
+    exact_match: bool,
 ) -> list[ExcelCellMatch]:
     """直接解析 xlsx 压缩包 XML 来搜索单元格，避免完整加载工作簿。"""
 
@@ -197,9 +218,9 @@ def _search_xlsx_xml_cells(
             # 启用数据过滤时后面还要读取列/行标记，所以先完整拿到共享字符串表。
             shared_strings = _read_shared_strings(archive, cancel_event) if data_filter_config is not None else None
             matching_shared_strings = (
-                _filter_matching_shared_strings(shared_strings, keyword, cancel_event)
+                _filter_matching_shared_strings(shared_strings, keyword, cancel_event, exact_match)
                 if shared_strings is not None
-                else _read_matching_shared_strings(archive, keyword, cancel_event)
+                else _read_matching_shared_strings(archive, keyword, cancel_event, exact_match)
             )
             if _is_cancelled(cancel_event):
                 return []
@@ -248,6 +269,7 @@ def _search_xlsx_xml_cells(
                         format_info,
                         cancel_event,
                         remaining_results,
+                        exact_match,
                     )
                 )
             return matches
@@ -487,6 +509,7 @@ def _filter_matching_shared_strings(
     shared_strings: list[str],
     keyword: str,
     cancel_event: Event | None = None,
+    exact_match: bool = False,
 ) -> dict[int, str]:
     """在已读取的共享字符串表中筛出包含关键词的条目。"""
 
@@ -494,7 +517,7 @@ def _filter_matching_shared_strings(
     for shared_string_index, text in enumerate(shared_strings):
         if _is_cancelled(cancel_event):
             break
-        if _get_matched_text(text, keyword) is not None:
+        if _get_matched_text(text, keyword, exact_match) is not None:
             matches[shared_string_index] = text
     return matches
 
@@ -503,6 +526,7 @@ def _read_matching_shared_strings(
     archive: zipfile.ZipFile,
     keyword: str,
     cancel_event: Event | None = None,
+    exact_match: bool = False,
 ) -> dict[int, str]:
     """只读取命中关键词的共享字符串，用于不需要数据过滤的快速路径。"""
 
@@ -528,7 +552,7 @@ def _read_matching_shared_strings(
         if not any(hint and hint in normalized_item_xml for hint in direct_hints) and b"<r>" not in normalized_item_xml:
             continue
         text = _decode_shared_string_item(item_xml)
-        if _get_matched_text(text, keyword) is not None:
+        if _get_matched_text(text, keyword, exact_match) is not None:
             matching_shared_strings[shared_string_index] = text
     return matching_shared_strings
 
@@ -559,6 +583,7 @@ def _search_sheet_xml_cells(
     format_info: WorkbookFormatInfo,
     cancel_event: Event | None,
     max_results: int | None,
+    exact_match: bool,
 ) -> list[ExcelCellMatch]:
     """解析单个工作表 XML，定位真正命中的行、列和值。"""
 
@@ -610,7 +635,13 @@ def _search_sheet_xml_cells(
             if not _is_enabled_cell(row_index, column_index, data_filter_state):
                 element.clear()
                 continue
-            matched_value = _get_xml_cell_match(element, matching_shared_strings, keyword, format_info)
+            matched_value = _get_xml_cell_match(
+                element,
+                matching_shared_strings,
+                keyword,
+                format_info,
+                exact_match,
+            )
             if matched_value is not None:
                 matches.append(
                     ExcelCellMatch(
@@ -833,6 +864,7 @@ def _get_xml_cell_match(
     matching_shared_strings: dict[int, str],
     keyword: str,
     format_info: WorkbookFormatInfo,
+    exact_match: bool = False,
 ) -> str | None:
     """读取 XML 单元格显示值，并判断是否包含关键词。"""
 
@@ -846,7 +878,7 @@ def _get_xml_cell_match(
         return matching_shared_strings.get(shared_string_index)
 
     if cell_type == "inlineStr":
-        return _get_matched_text(_rich_text(element), keyword)
+        return _get_matched_text(_rich_text(element), keyword, exact_match)
 
     raw_value = _find_child_text(element, "v")
     if raw_value is None:
@@ -854,7 +886,7 @@ def _get_xml_cell_match(
 
     if cell_type == "b":
         value = "TRUE" if raw_value == "1" else "FALSE" if raw_value == "0" else raw_value
-        return _get_matched_text(value, keyword)
+        return _get_matched_text(value, keyword, exact_match)
 
     style_index = _parse_int(element.attrib.get("s"), -1)
     if 0 <= style_index < len(format_info.number_formats):
@@ -863,11 +895,11 @@ def _get_xml_cell_match(
             format_info.number_formats[style_index],
             format_info.epoch,
         )
-        formatted_match = _get_first_matched_text(formatted_values, keyword)
+        formatted_match = _get_first_matched_text(formatted_values, keyword, exact_match)
         if formatted_match is not None:
             return formatted_match
 
-    return _get_matched_text(raw_value, keyword)
+    return _get_matched_text(raw_value, keyword, exact_match)
 
 
 def _format_numeric_search_values(raw_value: str, number_format: str, epoch: datetime) -> tuple[str, ...]:
@@ -931,11 +963,15 @@ def _format_date_search_values(value: object) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _get_first_matched_text(values: tuple[str, ...], keyword: str) -> str | None:
+def _get_first_matched_text(
+    values: tuple[str, ...],
+    keyword: str,
+    exact_match: bool = False,
+) -> str | None:
     """从多个显示候选值中返回第一个命中项。"""
 
     for value in values:
-        matched_value = _get_matched_text(value, keyword)
+        matched_value = _get_matched_text(value, keyword, exact_match)
         if matched_value is not None:
             return matched_value
     return None
@@ -1092,6 +1128,7 @@ def _search_xlrd_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
     max_results: int | None,
+    exact_match: bool,
 ) -> list[ExcelCellMatch]:
     """用 xlrd 搜索老格式 .xls 文件。"""
 
@@ -1135,9 +1172,10 @@ def _search_xlrd_cells(
                             matched_value = _get_first_matched_text(
                                 _format_date_search_values(date_value),
                                 keyword,
+                                exact_match,
                             )
                     if matched_value is None:
-                        matched_value = _get_matched_text(cell.value, keyword)
+                        matched_value = _get_matched_text(cell.value, keyword, exact_match)
                     if matched_value is None:
                         continue
                     matches.append(
@@ -1166,6 +1204,7 @@ def _search_xlsb_cells(
     data_filter_config: DataFilterConfig | None,
     cancel_event: Event | None,
     max_results: int | None,
+    exact_match: bool,
 ) -> list[ExcelCellMatch]:
     """用 pyxlsb 搜索 .xlsb 文件。"""
 
@@ -1198,7 +1237,7 @@ def _search_xlsb_cells(
                         for column_index, cell in enumerate(row, start=1):
                             if not _is_enabled_cell(row_index, column_index, data_filter_state):
                                 continue
-                            matched_value = _get_matched_text(cell.v, keyword)
+                            matched_value = _get_matched_text(cell.v, keyword, exact_match)
                             if matched_value is None:
                                 continue
                             matches.append(
@@ -1354,8 +1393,8 @@ def _is_cancelled(cancel_event: Event | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
 
-def _get_matched_text(value: object, keyword: str) -> str | None:
-    """返回包含关键词的最终缓存值；公式文本本身不参与匹配。"""
+def _get_matched_text(value: object, keyword: str, exact_match: bool = False) -> str | None:
+    """按包含或完整相等方式匹配最终缓存值；公式文本本身不参与匹配。"""
 
     if value is None:
         return None
@@ -1365,6 +1404,8 @@ def _get_matched_text(value: object, keyword: str) -> str | None:
     if text.startswith("="):
         return None
 
-    if keyword in text.lower():
+    normalized_text = text.lower()
+    is_match = normalized_text == keyword if exact_match else keyword in normalized_text
+    if is_match:
         return text
     return None

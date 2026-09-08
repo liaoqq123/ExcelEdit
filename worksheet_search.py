@@ -67,6 +67,7 @@ def scan_excel_workbooks(
     folder_path: str | Path,
     keyword: str = "",
     cancel_event: Event | None = None,
+    exact_match: bool = False,
 ) -> list[ExcelWorkbookInfo]:
     """扫描目录内 Excel 工作簿，并按关键词过滤工作簿名或工作表名。"""
 
@@ -78,7 +79,7 @@ def scan_excel_workbooks(
             if _is_cancelled(cancel_event):
                 break
 
-            path_matches = _path_matches_keyword(path, normalized_keyword)
+            path_matches = _path_matches_keyword(path, normalized_keyword, exact_match)
             try:
                 sheet_names = _get_cached_sheet_names(path)
                 error = None
@@ -104,7 +105,7 @@ def scan_excel_workbooks(
             if not normalized_keyword or path_matches:
                 matched_sheet_names = sheet_names
             else:
-                matched_sheet_names = _filter_sheet_names(sheet_names, normalized_keyword)
+                matched_sheet_names = _filter_sheet_names(sheet_names, normalized_keyword, exact_match)
                 if not matched_sheet_names:
                     continue
 
@@ -128,29 +129,40 @@ def _is_cancelled(cancel_event: Event | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
 
-def _path_matches_keyword(path: Path, keyword: str) -> bool:
+def _path_matches_keyword(path: Path, keyword: str, exact_match: bool = False) -> bool:
     """判断关键词是否命中文件名、文件主名或完整路径。"""
 
     if not keyword:
         return True
 
     return any(
-        keyword in part.lower()
-        for part in (
-            path.name,
-            path.stem,
-            str(path),
-        )
+        _text_matches_keyword(part, keyword, exact_match)
+        for part in (path.name, path.stem, str(path))
     )
 
 
-def _filter_sheet_names(sheet_names: list[str], keyword: str) -> list[str]:
+def _filter_sheet_names(
+    sheet_names: list[str],
+    keyword: str,
+    exact_match: bool = False,
+) -> list[str]:
     """只保留名称中包含关键词的工作表。"""
 
     if not keyword:
         return sheet_names
 
-    return [sheet_name for sheet_name in sheet_names if keyword in sheet_name.lower()]
+    return [
+        sheet_name
+        for sheet_name in sheet_names
+        if _text_matches_keyword(sheet_name, keyword, exact_match)
+    ]
+
+
+def _text_matches_keyword(text: str, keyword: str, exact_match: bool) -> bool:
+    """按包含或完整相等方式比较文本，保持原有的大小写不敏感行为。"""
+
+    normalized_text = text.lower()
+    return normalized_text == keyword if exact_match else keyword in normalized_text
 
 
 def _get_cached_sheet_names(path: Path) -> list[str]:

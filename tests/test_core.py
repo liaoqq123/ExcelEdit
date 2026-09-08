@@ -16,6 +16,7 @@ from cell_search import ExcelCellSearchIssue, search_excel_cells
 from excel_common import EXCEL_MAX_ROWS, ExcelReadError
 from file_search import search_files
 from popup_gui import parse_positive_int
+from worksheet_search import scan_excel_workbooks
 
 
 class InputValidationTests(unittest.TestCase):
@@ -172,6 +173,20 @@ class CellSearchTests(unittest.TestCase):
 
             self.assertEqual(len(search_excel_cells(root, "match", max_results=3)), 3)
 
+    def test_exact_cell_search_only_matches_the_complete_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workbook = xlsxwriter.Workbook(root / "exact.xlsx")
+            worksheet = workbook.add_worksheet("Data")
+            worksheet.write("A1", "needle")
+            worksheet.write("A2", "needle extra")
+            worksheet.write("A3", "NEEDLE")
+            workbook.close()
+
+            matches = search_excel_cells(root, "needle", exact_match=True)
+
+            self.assertEqual([match.row_index for match in matches], [1, 3])
+
 
 class FileSearchTests(unittest.TestCase):
     def test_file_result_limit_is_enforced(self) -> None:
@@ -180,6 +195,56 @@ class FileSearchTests(unittest.TestCase):
             for index in range(10):
                 (root / f"file-{index}.txt").write_text("", encoding="utf-8")
             self.assertEqual(len(search_files(root, max_results=4)), 4)
+
+    def test_file_suffix_filter_accepts_common_input_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for file_name in ("report.XLSX", "notes.txt", "archive.tar.gz", "image.png"):
+                (root / file_name).write_text("", encoding="utf-8")
+
+            results = search_files(root, suffixes="xlsx, *.tar.gz")
+
+            self.assertEqual([result.file_name for result in results], ["archive.tar.gz", "report.XLSX"])
+
+    def test_exact_file_search_only_matches_the_complete_file_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "report.txt").write_text("", encoding="utf-8")
+            (root / "report-copy.txt").write_text("", encoding="utf-8")
+
+            results = search_files(root, "report.txt", exact_match=True)
+
+            self.assertEqual([result.file_name for result in results], ["report.txt"])
+
+    def test_file_search_can_include_matching_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "Target").mkdir()
+            (root / "Target Extra").mkdir()
+            (root / "Target" / "inside.txt").write_text("", encoding="utf-8")
+
+            results = search_files(root, "target", exact_match=True, include_folders=True)
+
+            self.assertEqual([result.file_name for result in results], ["Target"])
+            self.assertTrue(results[0].is_directory)
+
+
+class WorksheetSearchTests(unittest.TestCase):
+    def test_exact_worksheet_search_matches_complete_sheet_or_workbook_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            exact_workbook = xlsxwriter.Workbook(root / "exact-book.xlsx")
+            exact_workbook.add_worksheet("Target")
+            exact_workbook.close()
+            similar_workbook = xlsxwriter.Workbook(root / "similar-book.xlsx")
+            similar_workbook.add_worksheet("Target Extra")
+            similar_workbook.close()
+
+            sheet_results = scan_excel_workbooks(root, "target", exact_match=True)
+            workbook_results = scan_excel_workbooks(root, "exact-book", exact_match=True)
+
+            self.assertEqual([result.workbook_name for result in sheet_results], ["exact-book.xlsx"])
+            self.assertEqual([result.workbook_name for result in workbook_results], ["exact-book.xlsx"])
 
 
 class CacheStoreTests(unittest.TestCase):

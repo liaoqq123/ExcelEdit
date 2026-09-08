@@ -4,7 +4,7 @@
 """
 
 from collections.abc import Callable
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 from decimal import Decimal, InvalidOperation
 import re
 import unicodedata
@@ -27,7 +27,7 @@ class SettingsDialog:
         self,
         master: ctk.CTk,
         default_disabled_marker: str,
-        on_save: Callable[[ReferenceLookupConfig, str, DataFilterConfig, str], None],
+        on_save: Callable[[ReferenceLookupConfig, str, DataFilterConfig, str, str], bool | None],
     ) -> None:
         self.master = master
         self.default_disabled_marker = default_disabled_marker
@@ -42,6 +42,7 @@ class SettingsDialog:
         self.enable_range_row_filter_var: ctk.BooleanVar | None = None
         self.disabled_marker_entry: ctk.CTkEntry | None = None
         self.help_url_entry: ctk.CTkEntry | None = None
+        self.background_image_entry: ctk.CTkEntry | None = None
 
     def open(
         self,
@@ -49,12 +50,19 @@ class SettingsDialog:
         disabled_sheet_marker: str,
         data_filter_config: DataFilterConfig,
         help_url: str,
+        background_image_path: str,
     ) -> None:
         """打开设置窗口，并把当前配置填回输入框。"""
 
         if self.window is None or not self.window.winfo_exists():
             self._build_window()
-        self._fill_entries(reference_config, disabled_sheet_marker, data_filter_config, help_url)
+        self._fill_entries(
+            reference_config,
+            disabled_sheet_marker,
+            data_filter_config,
+            help_url,
+            background_image_path,
+        )
 
         if self.window is None:
             return
@@ -208,6 +216,27 @@ class SettingsDialog:
         self.help_url_entry = ctk.CTkEntry(about_tab, placeholder_text="https://example.com")
         self.help_url_entry.grid(row=0, column=1, padx=(8, 12), pady=14, sticky="ew")
 
+        background_image_label = ctk.CTkLabel(about_tab, text="软件背景图", width=110, anchor="w")
+        background_image_label.grid(row=1, column=0, padx=(12, 8), pady=8, sticky="w")
+        self.background_image_entry = ctk.CTkEntry(about_tab, placeholder_text="未选择背景图片")
+        self.background_image_entry.grid(row=1, column=1, padx=(8, 8), pady=8, sticky="ew")
+        choose_background_button = ctk.CTkButton(
+            about_tab,
+            text="选择图片",
+            width=90,
+            command=self._choose_background_image,
+        )
+        choose_background_button.grid(row=1, column=2, padx=(0, 8), pady=8)
+        clear_background_button = ctk.CTkButton(
+            about_tab,
+            text="清除",
+            width=70,
+            fg_color="#64748b",
+            hover_color="#475569",
+            command=self._clear_background_image,
+        )
+        clear_background_button.grid(row=1, column=3, padx=(0, 12), pady=8)
+
         button_frame = ctk.CTkFrame(window, fg_color="transparent")
         button_frame.grid(row=1, column=0, padx=16, pady=(4, 16), sticky="e")
 
@@ -288,6 +317,7 @@ class SettingsDialog:
         disabled_sheet_marker: str,
         data_filter_config: DataFilterConfig,
         help_url: str,
+        background_image_path: str,
     ) -> None:
         """把当前配置值写入窗口输入框。"""
 
@@ -342,6 +372,7 @@ class SettingsDialog:
         if self.help_url_entry is not None:
             self.help_url_entry.delete(0, "end")
             self.help_url_entry.insert(0, help_url)
+        self._set_background_image_entry(background_image_path)
 
     def _save_settings(self) -> None:
         """读取并校验所有设置，成功后通过回调交给主窗口保存。"""
@@ -355,12 +386,15 @@ class SettingsDialog:
             messagebox.showerror("设置无效", str(exc), parent=self.window)
             return
 
-        self.on_save(
+        save_succeeded = self.on_save(
             config,
             self._read_disabled_marker_entry(),
             data_filter_config,
             self._read_help_url_entry(),
+            self._read_background_image_entry(),
         )
+        if save_succeeded is False:
+            return
         self.close()
 
     def _read_reference_settings_entries(self) -> ReferenceLookupConfig:
@@ -453,6 +487,40 @@ class SettingsDialog:
             return ""
         return self.help_url_entry.get().strip()
 
+    def _choose_background_image(self) -> None:
+        """使用 Windows 文件选择窗口挑选常见图片格式。"""
+
+        image_path = filedialog.askopenfilename(
+            parent=self.window,
+            title="选择软件背景图",
+            filetypes=[
+                ("所有图片文件", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff;*.ico;*.avif"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if image_path:
+            self._set_background_image_entry(image_path)
+
+    def _clear_background_image(self) -> None:
+        """清空待保存的背景图路径，恢复默认背景。"""
+
+        self._set_background_image_entry("")
+
+    def _set_background_image_entry(self, image_path: str) -> None:
+        """把背景图路径写入输入框。"""
+
+        if self.background_image_entry is None:
+            return
+        self.background_image_entry.delete(0, "end")
+        self.background_image_entry.insert(0, image_path)
+
+    def _read_background_image_entry(self) -> str:
+        """读取背景图路径。"""
+
+        if self.background_image_entry is None:
+            return ""
+        return self.background_image_entry.get().strip()
+
     def close(self) -> None:
         """关闭弹窗并清空控件引用，避免下次复用失效对象。"""
 
@@ -468,6 +536,179 @@ class SettingsDialog:
         self.enable_range_row_filter_var = None
         self.disabled_marker_entry = None
         self.help_url_entry = None
+        self.background_image_entry = None
+
+
+class SearchSettingsDialog:
+    """检索筛选弹窗，按分类集中管理全部检索条件。"""
+
+    def __init__(
+        self,
+        master: ctk.CTk,
+        on_save: Callable[[bool, bool, bool, str, bool, bool], None],
+    ) -> None:
+        self.master = master
+        self.on_save = on_save
+        self.window: ctk.CTkToplevel | None = None
+        self.search_mode = "工作表检索"
+        self.settings_frame: ctk.CTkScrollableFrame | None = None
+        self.file_suffixes_entry: ctk.CTkEntry | None = None
+        self.only_enabled_sheets_var = ctk.BooleanVar(value=False)
+        self.only_enabled_data_var = ctk.BooleanVar(value=False)
+        self.only_specified_suffixes_var = ctk.BooleanVar(value=False)
+        self.file_suffixes_var = ctk.StringVar(value="")
+        self.search_folders_var = ctk.BooleanVar(value=False)
+        self.exact_match_var = ctk.BooleanVar(value=False)
+
+    def open(
+        self,
+        search_mode: str,
+        only_enabled_sheets: bool,
+        only_enabled_data: bool,
+        only_specified_suffixes: bool,
+        file_suffixes: str,
+        search_folders: bool,
+        exact_match: bool,
+    ) -> None:
+        """打开检索设置，并把主界面当前选项复制到临时表单。"""
+
+        self.search_mode = search_mode
+        self.only_enabled_sheets_var.set(only_enabled_sheets)
+        self.only_enabled_data_var.set(only_enabled_data)
+        self.only_specified_suffixes_var.set(only_specified_suffixes)
+        self.file_suffixes_var.set(file_suffixes)
+        self.search_folders_var.set(search_folders)
+        self.exact_match_var.set(exact_match)
+
+        if self.window is None or not self.window.winfo_exists():
+            self._build_window()
+        self._update_file_suffix_entry_state()
+
+        if self.window is not None:
+            self.window.lift()
+            self.window.focus_force()
+
+    def refresh(self, search_mode: str) -> None:
+        """记录当前检索类型，供下次打开检索设置时使用。"""
+
+        self.search_mode = search_mode
+
+    def _build_window(self) -> None:
+        """创建检索设置窗口。"""
+
+        window = ctk.CTkToplevel(self.master)
+        window.title("检索设置")
+        window.geometry("540x480")
+        window.minsize(480, 400)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self.close)
+        window.transient(self.master)
+
+        settings_frame = ctk.CTkScrollableFrame(window)
+        settings_frame.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="nsew")
+        settings_frame.grid_columnconfigure(1, weight=1)
+
+        self._add_category_title(settings_frame, 0, "通用设置")
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="精确查找",
+            variable=self.exact_match_var,
+        ).grid(row=1, column=0, columnspan=2, padx=16, pady=(0, 14), sticky="w")
+
+        self._add_category_title(settings_frame, 2, "工作表检索设置")
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="仅检索启用表格（也应用于单元格检索）",
+            variable=self.only_enabled_sheets_var,
+        ).grid(row=3, column=0, columnspan=2, padx=16, pady=(0, 14), sticky="w")
+
+        self._add_category_title(settings_frame, 4, "单元格检索设置")
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="仅检索启用数据",
+            variable=self.only_enabled_data_var,
+        ).grid(row=5, column=0, columnspan=2, padx=16, pady=(0, 14), sticky="w")
+
+        self._add_category_title(settings_frame, 6, "文件检索设置")
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="检索文件夹",
+            variable=self.search_folders_var,
+        ).grid(row=7, column=0, columnspan=2, padx=16, pady=(0, 6), sticky="w")
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="仅检索指定后缀文件",
+            variable=self.only_specified_suffixes_var,
+            command=self._update_file_suffix_entry_state,
+        ).grid(row=8, column=0, columnspan=2, padx=16, pady=6, sticky="w")
+        suffix_label = ctk.CTkLabel(settings_frame, text="文件后缀", width=90, anchor="w")
+        suffix_label.grid(row=9, column=0, padx=(16, 8), pady=(6, 16), sticky="w")
+        self.file_suffixes_entry = ctk.CTkEntry(
+            settings_frame,
+            textvariable=self.file_suffixes_var,
+            placeholder_text="例如：xlsx, pdf, docx",
+        )
+        self.file_suffixes_entry.grid(row=9, column=1, padx=(8, 16), pady=(6, 16), sticky="ew")
+
+        button_frame = ctk.CTkFrame(window, fg_color="transparent")
+        button_frame.grid(row=1, column=0, padx=16, pady=(4, 16), sticky="e")
+
+        cancel_button = ctk.CTkButton(
+            button_frame,
+            text="取消",
+            width=90,
+            fg_color="#64748b",
+            hover_color="#475569",
+            command=self.close,
+        )
+        cancel_button.grid(row=0, column=0, padx=8)
+
+        save_button = ctk.CTkButton(button_frame, text="保存", width=90, command=self._save)
+        save_button.grid(row=0, column=1, padx=(8, 0))
+
+        self.window = window
+        self.settings_frame = settings_frame
+
+    def _add_category_title(self, parent: ctk.CTkScrollableFrame, row_index: int, text: str) -> None:
+        """在检索设置内添加分类标题。"""
+
+        ctk.CTkLabel(
+            parent,
+            text=text,
+            font=("Microsoft YaHei UI", 14, "bold"),
+            anchor="w",
+        ).grid(row=row_index, column=0, columnspan=2, padx=16, pady=(14, 8), sticky="w")
+
+    def _update_file_suffix_entry_state(self) -> None:
+        """只有选中指定后缀条件时，才能编辑后缀文本。"""
+
+        if self.file_suffixes_entry is None:
+            return
+        state = "normal" if self.only_specified_suffixes_var.get() else "disabled"
+        self.file_suffixes_entry.configure(state=state)
+
+    def _save(self) -> None:
+        """保存临时筛选项并关闭窗口。"""
+
+        self.on_save(
+            self.only_enabled_sheets_var.get(),
+            self.only_enabled_data_var.get(),
+            self.only_specified_suffixes_var.get(),
+            self.file_suffixes_var.get().strip(),
+            self.search_folders_var.get(),
+            self.exact_match_var.get(),
+        )
+        self.close()
+
+    def close(self) -> None:
+        """关闭检索设置窗口。"""
+
+        if self.window is not None and self.window.winfo_exists():
+            self.window.destroy()
+        self.window = None
+        self.settings_frame = None
+        self.file_suffixes_entry = None
 
 
 def parse_positive_int(value: object, field_label: str, maximum: int | None = None) -> int:

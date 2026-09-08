@@ -23,9 +23,15 @@ def get_app_directory() -> Path:
 def get_user_cache_file() -> Path:
     """返回当前用户可写的缓存路径，避免安装目录权限导致保存失败。"""
 
+    return get_user_cache_directory() / CACHE_FILE_NAME
+
+
+def get_user_cache_directory() -> Path:
+    """返回当前用户的软件数据目录，供缓存和用户选择的资源共用。"""
+
     local_app_data = os.environ.get("LOCALAPPDATA")
     base_directory = Path(local_app_data) if local_app_data else Path.home() / ".local" / "share"
-    return base_directory / APP_CACHE_DIRECTORY_NAME / CACHE_FILE_NAME
+    return base_directory / APP_CACHE_DIRECTORY_NAME
 
 
 CACHE_FILE = get_user_cache_file()
