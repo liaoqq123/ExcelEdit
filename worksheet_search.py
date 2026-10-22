@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
+from search_status import SearchTracker
 
 from openpyxl import load_workbook
 
@@ -68,24 +69,28 @@ def scan_excel_workbooks(
     keyword: str = "",
     cancel_event: Event | None = None,
     exact_match: bool = False,
+    tracker: SearchTracker | None = None,
 ) -> list[ExcelWorkbookInfo]:
     """扫描目录内 Excel 工作簿，并按关键词过滤工作簿名或工作表名。"""
 
     normalized_keyword = keyword.strip().lower()
     results: list[ExcelWorkbookInfo] = []
+    tracker = tracker or SearchTracker()
 
     try:
-        for path in iter_excel_files(folder_path, cancel_event=cancel_event):
+        for path in iter_excel_files(folder_path, cancel_event=cancel_event, tracker=tracker):
             if _is_cancelled(cancel_event):
                 break
 
             path_matches = _path_matches_keyword(path, normalized_keyword, exact_match)
+            tracker.scan(path)
             try:
                 sheet_names = _get_cached_sheet_names(path)
                 error = None
             except ExcelReadError as exc:
                 sheet_names = []
                 error = str(exc)
+                tracker.issue(path, exc)
 
             if _is_cancelled(cancel_event):
                 break
@@ -117,9 +122,12 @@ def scan_excel_workbooks(
                     error=None,
                 )
             )
+            tracker.result_count = len(results)
     finally:
         _flush_sheet_name_cache()
 
+    tracker.result_count = len(results)
+    tracker.finish("cancelled" if _is_cancelled(cancel_event) else "completed")
     return results
 
 

@@ -9,21 +9,22 @@ import subprocess
 import sys
 import tempfile
 import webbrowser
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from time import perf_counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
-from tkinter import Frame as TkFrame, filedialog, font as tkfont, messagebox, ttk
+from tkinter import Frame as TkFrame, Canvas, Menu, filedialog, font as tkfont, messagebox, ttk
 
 import customtkinter as ctk
+import ui_theme as ui
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from cache_store import get_user_cache_directory
 from cache_store import read_cache_data as read_shared_cache_data
 from cache_store import update_cache_data as update_shared_cache_data
 from cell_search import (
-    DEFAULT_MAX_SEARCH_RESULTS,
     DEFAULT_DATA_FILTER_CONFIG,
     DataFilterConfig,
     ExcelCellMatch,
@@ -32,12 +33,19 @@ from cell_search import (
     validate_data_filter_config,
 )
 from excel_common import EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError
+from file_result_view import FileResultView
+from result_preview import ResultPreviewPane
+from search_status import SearchSnapshot, SearchTracker
 from file_search import (
-    DEFAULT_MAX_FILE_SEARCH_RESULTS,
     FileSearchError,
     FileSearchResult,
     normalize_file_suffixes,
     search_files,
+)
+from json_validation import (
+    DEFAULT_MAX_JSON_VALIDATION_ERRORS,
+    JsonValidationReport,
+    validate_excel_json_columns,
 )
 from popup_gui import SearchSettingsDialog, SettingsDialog, parse_positive_int
 from worksheet_search import (
@@ -81,26 +89,26 @@ WORKSHEET_RESULT_COLUMNS = (
     ("action", "操作", 132, 120, False),
 )
 CELL_RESULT_COLUMNS = (
-    ("value", "数据内容", 620, 260, True),
-    ("action", "操作", 132, 120, False),
+    ("value", "命中内容", 500, 180, True),
+    ("action", "操作", 110, 100, False),
 )
 FILE_TABLE_RESULT_COLUMNS = (
     ("file_name", "文件/文件夹名", 320, 180, True),
     ("item_type", "类型", 150, 120, False),
     ("file_address", "所在位置", 620, 320, True),
 )
+JSON_RESULT_COLUMNS = (
+    ("sheet", "工作表", 240, 160, True),
+    ("cell", "单元格", 110, 90, False),
+    ("value", "JSON 内容", 360, 200, True),
+    ("message", "错误原因", 320, 180, True),
+)
 FILE_THUMBNAIL_COLUMNS = 4
-FILE_THUMBNAIL_CARD_WIDTH = 210
-FILE_THUMBNAIL_CARD_HEIGHT = 176
 IMAGE_FILE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
-FILE_THUMBNAIL_IMAGE_SIZE = (64, 64)
-THUMBNAIL_BACKGROUND_COLOR = "#ffffff"
-THUMBNAIL_TEXT_COLOR = "#1f2937"
-THUMBNAIL_SECONDARY_TEXT_COLOR = "#64748b"
 BACKGROUND_IMAGE_FILE_NAME = "software_background.png"
 BACKGROUND_RENDER_MAX_SIZE = (2560, 1440)
 TRANSLUCENT_STRIP_OPACITY = 0.85
-TRANSLUCENT_STRIP_COLOR = (238, 241, 245)
+TRANSLUCENT_STRIP_COLOR = tuple(int(ui.TOOLBAR_BG[index:index + 2], 16) for index in (1, 3, 5))
 
 
 @dataclass(frozen=True)
@@ -124,8 +132,8 @@ class ExcelEditApp(ctk.CTk):
 
         self.title(APP_NAME)
         self._set_app_icon()
-        self.geometry("1080x680")
-        self.minsize(840, 520)
+        self.geometry("1440x900")
+        self.minsize(1080, 680)
 
         self.item_targets: dict[str, ResultTarget] = {}
         self.reference_items_by_source: dict[str, list[str]] = {}
@@ -133,6 +141,11 @@ class ExcelEditApp(ctk.CTk):
         self.action_buttons: dict[str, ctk.CTkButton] = {}
         self.directory_buttons: dict[str, ctk.CTkButton] = {}
         self.action_layout_job: str | None = None
+        self.action_item_ids: set[str] = set()
+        self.directory_item_ids: set[str] = set()
+        self.tree_render_job: str | None = None
+        self.tree_render_serial = 0
+        self.search_tracker: SearchTracker | None = None
         self.current_result_columns: tuple[str, ...] = ()
         self.file_thumbnail_results: list[FileSearchResult] = []
         self.file_thumbnail_cards: list[ctk.CTkFrame] = []
@@ -154,6 +167,8 @@ class ExcelEditApp(ctk.CTk):
         self.result_grid_layout_job: str | None = None
         self.folder_path_var = ctk.StringVar(value="")
         self.folder_history: list[str] = []
+        self.folder_dropdown_active = False
+        self.folder_history_refresh_pending = False
         self.search_mode_var = ctk.StringVar(value="工作表检索")
         self.only_enabled_sheets_var = ctk.BooleanVar(value=False)
         self.only_enabled_data_var = ctk.BooleanVar(value=False)
@@ -163,6 +178,18 @@ class ExcelEditApp(ctk.CTk):
         self.exact_match_var = ctk.BooleanVar(value=False)
         self.current_keyword = ""
         self.current_exact_match = False
+        self.pinned_folders: list[str] = []
+        self.preview_enabled = True
+        self.selected_target: ResultTarget | None = None
+        self.item_raw_values: dict[str, str] = {}
+        self.result_source: tuple[str, object] | None = None
+        self.local_filter_var = ctk.StringVar(value="")
+        self.local_filter_job: str | None = None
+        self.local_sheet_scope: tuple[Path, str] | None = None
+        self._filter_rendering = False
+        self.result_sheet_enabled_only = False
+        self.result_disabled_marker = DEFAULT_DISABLED_SHEET_MARKER
+        self.density_var = ctk.StringVar(value="舒适")
         self.reference_config = DEFAULT_REFERENCE_LOOKUP_CONFIG
         self.disabled_sheet_marker = DEFAULT_DISABLED_SHEET_MARKER
         self.data_filter_config = DEFAULT_DATA_FILTER_CONFIG
@@ -259,7 +286,6 @@ class ExcelEditApp(ctk.CTk):
         self.background_image_path = normalized_path
         self.background_source_image = source_image
         self.background_fitted_image = None
-        self.background_display_image = None
         self.background_render_size = None
         self.translucent_strip_layout_keys.clear()
         self._schedule_background_image_layout()
@@ -309,13 +335,15 @@ class ExcelEditApp(ctk.CTk):
     def _schedule_background_image_layout(self) -> None:
         """合并窗口尺寸变化事件，避免连续拖动窗口时重复缩放图片。"""
 
-        if self.background_layout_job is not None:
+        if self.is_closing or self.background_layout_job is not None:
             return
         self.background_layout_job = self.after(120, self._layout_background_image)
 
     def _on_app_configure(self, _event: object) -> None:
         """窗口尺寸变化时，同步背景图和半透明条的尺寸。"""
 
+        if self.is_closing or getattr(_event, "widget", None) is not self:
+            return
         self._schedule_background_image_layout()
         self._schedule_translucent_strip_layout()
 
@@ -323,13 +351,17 @@ class ExcelEditApp(ctk.CTk):
         """将背景图按窗口尺寸等比裁切填充。"""
 
         self.background_layout_job = None
+        if self.is_closing:
+            return
         if self.background_image_label is None:
             return
         if self.background_source_image is None:
             self.background_fitted_image = None
             self.background_render_size = None
-            self.background_image_label.configure(image=None)
-            self._schedule_translucent_strip_layout()
+            if self.background_display_image is not None:
+                self.background_image_label.configure(image="")
+                self.background_display_image = None
+                self._schedule_translucent_strip_layout()
             return
 
         width = self.winfo_width()
@@ -368,12 +400,13 @@ class ExcelEditApp(ctk.CTk):
         self.translucent_strip_frames[name] = frame
         self.translucent_strip_overlays[name] = overlay
         overlay.lower()
+        frame.bind("<Configure>", lambda _event: self._schedule_translucent_strip_layout(), add="+")
         self._schedule_translucent_strip_layout()
 
     def _schedule_translucent_strip_layout(self) -> None:
         """合并半透明条的重绘请求。"""
 
-        if self.translucent_strip_layout_job is not None:
+        if self.is_closing or self.translucent_strip_layout_job is not None:
             return
         self.translucent_strip_layout_job = self.after(120, self._layout_translucent_strips)
 
@@ -381,6 +414,8 @@ class ExcelEditApp(ctk.CTk):
         """以背景图为底绘制 85% 不透明的浅色条。"""
 
         self.translucent_strip_layout_job = None
+        if self.is_closing:
+            return
         opacity = round(255 * TRANSLUCENT_STRIP_OPACITY)
         for name, frame in self.translucent_strip_frames.items():
             overlay = self.translucent_strip_overlays.get(name)
@@ -392,16 +427,20 @@ class ExcelEditApp(ctk.CTk):
                 overlay.place_forget()
                 continue
 
-            overlay.configure(width=width, height=height)
-            overlay.place(x=0, y=0)
+            if self.background_fitted_image is None:
+                if name in self.translucent_strip_images:
+                    overlay.configure(image="")
+                    self.translucent_strip_images.pop(name)
+                if overlay.winfo_manager() == "place":
+                    overlay.place_forget()
+                self.translucent_strip_layout_keys.pop(name, None)
+                continue
+
             layout_key = (x, y, width, height, id(self.background_fitted_image))
             if self.translucent_strip_layout_keys.get(name) == layout_key:
                 continue
-            if self.background_fitted_image is None:
-                overlay.configure(image=None, fg_color="#eef1f5")
-                self.translucent_strip_layout_keys[name] = layout_key
-                continue
-
+            overlay.configure(width=width, height=height)
+            overlay.place(x=0, y=0)
             background_crop = self.background_fitted_image.crop((x, y, x + width, y + height)).convert("RGBA")
             tint = Image.new("RGBA", background_crop.size, (*TRANSLUCENT_STRIP_COLOR, opacity))
             overlay_image = Image.alpha_composite(background_crop, tint)
@@ -423,254 +462,28 @@ class ExcelEditApp(ctk.CTk):
             self.translucent_strip_layout_keys[name] = layout_key
 
     def _build_layout(self) -> None:
-        """创建主界面的所有控件和布局。"""
-
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
-        self.background_image_label = ctk.CTkLabel(self, text="", fg_color="transparent")
-        self.background_image_label.place(x=0, y=0, relwidth=1, relheight=1)
-        self.background_image_label.lower()
-        self.bind("<Configure>", self._on_app_configure, add="+")
-
-        # 顶部工具区：设置和帮助入口。
-        top_frame = ctk.CTkFrame(self, fg_color="transparent")
-        top_frame.grid(row=0, column=0, padx=16, pady=(16, 4), sticky="ew")
-        top_frame.grid_columnconfigure(3, weight=1)
-        self._register_translucent_strip("top", top_frame)
-
-        self.settings_button = ctk.CTkButton(
-            top_frame,
-            text="设置",
-            width=82,
-            height=26,
-            font=("Microsoft YaHei UI", 12),
-            command=self.open_settings,
-        )
-        self.settings_button.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="w")
-
-        self.help_button = ctk.CTkButton(
-            top_frame,
-            text="使用说明",
-            width=92,
-            height=26,
-            font=("Microsoft YaHei UI", 12),
-            command=self.open_help_url,
-        )
-        self.help_button.grid(row=0, column=1, padx=(0, 8), pady=0, sticky="w")
-
-        self.search_settings_button = ctk.CTkButton(
-            top_frame,
-            text="检索设置",
-            width=92,
-            height=26,
-            font=("Microsoft YaHei UI", 12),
-            command=self.open_search_settings,
-        )
-        self.search_settings_button.grid(row=0, column=2, padx=0, pady=0, sticky="w")
-
-        # 文件夹地址和关键词并排展示，减少顶部区域占用的高度。
-        search_input_frame = ctk.CTkFrame(self, fg_color="transparent")
-        search_input_frame.grid(row=1, column=0, padx=16, pady=(4, 8), sticky="ew")
-        search_input_frame.grid_columnconfigure(1, weight=3)
-        search_input_frame.grid_columnconfigure(4, weight=2)
-        self._register_translucent_strip("search_input", search_input_frame)
-
-        folder_label = ctk.CTkLabel(search_input_frame, text="文件夹地址", width=90, anchor="w")
-        folder_label.grid(row=0, column=0, padx=(12, 8), pady=12)
-
-        self.folder_entry = ctk.CTkComboBox(
-            search_input_frame,
-            variable=self.folder_path_var,
-            values=[],
-            command=self._select_folder_from_history,
-            fg_color="#ffffff",
-            button_color="#e5e7eb",
-            button_hover_color="#d1d5db",
-            dropdown_fg_color="#ffffff",
-            dropdown_hover_color="#e5e7eb",
-            dropdown_text_color="#111827",
-            text_color="#111827",
-        )
-        self.folder_entry.grid(row=0, column=1, padx=(0, 8), pady=12, sticky="ew")
-        self.folder_entry.bind("<FocusOut>", lambda _event: self._save_cache_from_inputs())
-        # CustomTkinter 的下拉菜单默认偏窄，这里接管打开逻辑来同步历史列表宽度。
-        self.folder_entry._open_dropdown_menu = self._open_folder_dropdown_menu
-        search_input_frame.bind("<Configure>", lambda _event: self._sync_folder_dropdown_width(), add="+")
-        self.after_idle(self._sync_folder_dropdown_width)
-
-        choose_button = ctk.CTkButton(search_input_frame, text="选择文件夹", width=120, command=self.choose_folder)
-        choose_button.grid(row=0, column=2, padx=(0, 16), pady=12)
-
-        # 关键词输入框会被不同检索模式复用。
-        keyword_label = ctk.CTkLabel(search_input_frame, text="输入内容", width=90, anchor="w")
-        keyword_label.grid(row=0, column=3, padx=(0, 8), pady=12)
-
-        self.keyword_entry = ctk.CTkEntry(search_input_frame, placeholder_text="可输入工作簿、工作表、单元格、文件名或文件地址关键词；留空则显示全部")
-        self.keyword_entry.grid(row=0, column=4, padx=(0, 12), pady=12, sticky="ew")
-        self.keyword_entry.bind("<Return>", lambda _event: self.run_selected_search())
-        self.keyword_entry.bind("<FocusOut>", lambda _event: self._save_cache_from_inputs())
-
-        # 检索操作区：模式下拉框、取消按钮、检索按钮和状态栏。
-        action_frame = ctk.CTkFrame(self, fg_color="transparent")
-        action_frame.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
-        action_frame.grid_columnconfigure(1, weight=1)
-        self._register_translucent_strip("search_action", action_frame)
-
-        self.search_mode_menu = ctk.CTkOptionMenu(
-            action_frame,
-            values=["工作表检索", "单元格检索", "文件检索"],
-            variable=self.search_mode_var,
-            width=140,
-            fg_color="#ffffff",
-            button_color="#e5e7eb",
-            button_hover_color="#d1d5db",
-            dropdown_fg_color="#ffffff",
-            dropdown_hover_color="#e5e7eb",
-            dropdown_text_color="#111827",
-            text_color="#111827",
-            command=self._on_search_mode_changed,
-        )
-        self.search_mode_menu.grid(row=0, column=0, padx=(12, 8), pady=12, sticky="w")
-
-        self.cancel_search_button = ctk.CTkButton(
-            action_frame,
-            text="取消",
-            width=82,
-            fg_color="#dc2626",
-            hover_color="#b91c1c",
-            text_color="#ffffff",
-            command=self.cancel_current_search,
-        )
-        self.cancel_search_button.grid(row=0, column=2, padx=(8, 0), pady=12, sticky="e")
-        self.cancel_search_button.grid_remove()
-
-        self.run_search_button = ctk.CTkButton(action_frame, text="检索", width=110, command=self.run_selected_search)
-        self.run_search_button.grid(row=0, column=3, padx=(8, 12), pady=12, sticky="e")
-
-        self.status_label = ctk.CTkLabel(action_frame, text="请选择文件夹后执行检索", anchor="w")
-        self.status_label.grid(row=0, column=1, padx=8, pady=12, sticky="ew")
-
-        # 工作表与单元格检索固定使用表格；文件检索使用缩略图卡片。
-        list_frame = ctk.CTkFrame(self)
-        self.result_list_frame = list_frame
-        list_frame.grid(row=3, column=0, padx=16, pady=(8, 16), sticky="nsew")
-        list_frame.grid_columnconfigure(0, weight=1)
-        list_frame.grid_rowconfigure(1, weight=1)
-
-        self.result_group_controls = ctk.CTkFrame(list_frame, fg_color="transparent")
-        self.result_group_controls.grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            padx=8,
-            pady=(6, 2),
-            sticky="ew",
-        )
-        self.result_group_controls.grid_columnconfigure(0, weight=1)
-
-        self.collapse_all_results_button = ctk.CTkButton(
-            self.result_group_controls,
-            text="全部收起",
-            width=88,
-            height=28,
-            command=self.collapse_all_results,
-        )
-        self.collapse_all_results_button.grid(row=0, column=1, padx=(0, 6), sticky="e")
-
-        self.expand_all_results_button = ctk.CTkButton(
-            self.result_group_controls,
-            text="全部展开",
-            width=88,
-            height=28,
-            command=self.expand_all_results,
-        )
-        self.expand_all_results_button.grid(row=0, column=2, sticky="e")
-        self.result_group_controls.grid_remove()
-
-        self.file_result_view_controls = ctk.CTkFrame(list_frame, fg_color="transparent")
-        self.file_result_view_controls.grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            padx=8,
-            pady=(6, 2),
-            sticky="ew",
-        )
-        self.file_result_view_controls.grid_columnconfigure(0, weight=1)
-        self.file_result_count_label = ctk.CTkLabel(
-            self.file_result_view_controls,
-            text="",
-            anchor="w",
-        )
-        self.file_result_count_label.grid(row=0, column=0, padx=(0, 12), sticky="w")
-        self.file_result_view_switch = ctk.CTkSegmentedButton(
-            self.file_result_view_controls,
-            values=["缩略图", "表格"],
-            variable=self.file_result_view_var,
-            command=self._on_file_result_view_changed,
-            width=176,
-        )
-        self.file_result_view_switch.grid(row=0, column=1, sticky="e")
-        self.file_result_view_controls.grid_remove()
-
-        self._configure_tree_style()
-        self.result_tree = ttk.Treeview(
-            list_frame,
-            columns=(),
-            show="headings",
-            selectmode="browse",
-        )
-        self.result_tree.grid(row=1, column=0, sticky="nsew")
-        self.result_tree.bind("<ButtonRelease-1>", self._handle_result_click)
-        self.result_tree.bind("<Double-1>", self._handle_result_double_click)
-        self.result_tree.bind("<Configure>", lambda _event: self._schedule_action_button_layout())
-        self.result_tree.bind("<Configure>", lambda _event: self._schedule_result_grid_lines(), add="+")
-        self.result_tree.tag_configure("reference", foreground="#2563eb")
-        self.result_tree.tag_configure("cell-workbook", background="#4b5563", foreground="#ffffff")
-        self.result_tree.tag_configure("cell-sheet", background="#e5e7eb", foreground="#111827")
+        from main_layout import build_main_layout
+        build_main_layout(self)
         self._configure_result_columns(WORKSHEET_RESULT_COLUMNS)
-
-        self.result_tree_vertical_scroll = ttk.Scrollbar(
-            list_frame,
-            orient="vertical",
-            command=self._scroll_result_tree_y,
-        )
-        self.result_tree_vertical_scroll.grid(row=1, column=1, sticky="ns")
-        self.result_tree_horizontal_scroll = ttk.Scrollbar(
-            list_frame,
-            orient="horizontal",
-            command=self._scroll_result_tree_x,
-        )
-        self.result_tree_horizontal_scroll.grid(row=2, column=0, sticky="ew")
-        self.result_tree.configure(
-            yscrollcommand=lambda *args: self._update_scrollbar(self.result_tree_vertical_scroll, *args),
-            xscrollcommand=lambda *args: self._update_scrollbar(self.result_tree_horizontal_scroll, *args),
-        )
-
-        self.file_thumbnail_frame = ctk.CTkScrollableFrame(
-            list_frame,
-            fg_color=THUMBNAIL_BACKGROUND_COLOR,
-            corner_radius=0,
-        )
-        self.file_thumbnail_frame.grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            padx=4,
-            pady=(0, 4),
-            sticky="nsew",
-        )
-        for column_index in range(FILE_THUMBNAIL_COLUMNS):
-            self.file_thumbnail_frame.grid_columnconfigure(column_index, weight=1, uniform="file-thumbnail")
-        self.file_thumbnail_frame.grid_remove()
+        self._refresh_filter_chips()
 
     def _configure_tree_style(self) -> None:
         """统一结果列表的行高和字体样式。"""
 
         style = ttk.Style(self)
         style.theme_use("default")
-        style.configure("Treeview", rowheight=30, font=("Microsoft YaHei UI", 10))
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Treeview", rowheight=36, font=("Microsoft YaHei UI", 10),
+                        background=ui.TABLE_BG, fieldbackground=ui.TABLE_BG, foreground=ui.TEXT,
+                        borderwidth=0, relief="flat")
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9), background=ui.HEADER_BG,
+                        foreground=ui.HEADING_TEXT, relief="flat", padding=(8, 9))
+        style.map("Treeview", background=[("selected", ui.SELECTION_BG)], foreground=[("selected", ui.SELECTION_TEXT)])
+        style.map("Treeview.Heading", background=[("active", ui.HOVER_BG)])
+        for name in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(name, background=ui.HEADER_BG, troughcolor=ui.TABLE_BG,
+                            bordercolor=ui.TABLE_BG, arrowcolor=ui.HEADING_TEXT,
+                            lightcolor=ui.BORDER, darkcolor=ui.BORDER)
+            style.map(name, background=[("active", ui.HOVER_BG)])
 
     def _show_table_results(self) -> None:
         """显示工作表或单元格检索使用的表格视图。"""
@@ -762,9 +575,9 @@ class ExcelEditApp(ctk.CTk):
             width=96,
             height=24,
             corner_radius=5,
-            fg_color="#2563eb",
-            hover_color="#1d4ed8",
-            text_color="#ffffff",
+            fg_color=ui.ACCENT,
+            hover_color=ui.ACCENT_HOVER,
+            text_color=ui.ON_ACCENT,
             command=lambda item=item_id: self._click_reference_button(item),
         )
         self.action_buttons[item_id] = button
@@ -778,9 +591,9 @@ class ExcelEditApp(ctk.CTk):
             width=96,
             height=24,
             corner_radius=5,
-            fg_color="#475569",
-            hover_color="#334155",
-            text_color="#ffffff",
+            fg_color=ui.TEXT,
+            hover_color=ui.TEXT,
+            text_color=ui.ON_ACCENT,
             command=lambda item=item_id: self._open_directory_for_item(item),
         )
         self.directory_buttons[item_id] = button
@@ -890,7 +703,7 @@ class ExcelEditApp(ctk.CTk):
     def _create_result_grid_line(self, x: int, y: int, width: int, height: int) -> None:
         """创建一条不影响列宽的覆盖式网格线。"""
 
-        line = TkFrame(self.result_list_frame, bg="#cbd5e1", highlightthickness=0, bd=0)
+        line = TkFrame(self.result_list_frame, bg=ui.DIVIDER, highlightthickness=0, bd=0)
         line.place(x=x, y=y, width=width, height=height)
         line.lift()
         self.result_grid_lines.append(line)
@@ -910,33 +723,337 @@ class ExcelEditApp(ctk.CTk):
         self.action_layout_job = self.after_idle(self._layout_action_buttons)
 
     def _layout_action_buttons(self) -> None:
-        """把真实按钮摆放到 Treeview 的“操作”列单元格上。"""
+        """只为可见行分配操作按钮，滚动时复用离开视口的按钮。"""
 
         self.action_layout_job = None
-        if "action" not in self.current_result_columns:
-            for button in (*self.action_buttons.values(), *self.directory_buttons.values()):
-                button.place_forget()
+        visible = set(self._get_visible_result_item_ids()) if "action" in self.current_result_columns else set()
+        for buttons, eligible, create, reference in (
+            (self.action_buttons, self.action_item_ids, self._create_action_button, True),
+            (self.directory_buttons, self.directory_item_ids, self._create_directory_button, False),
+        ):
+            spare = []
+            for item_id in list(buttons):
+                if item_id not in visible:
+                    button = buttons.pop(item_id)
+                    button.place_forget()
+                    spare.append(button)
+            for item_id in visible & eligible:
+                bbox = self.result_tree.bbox(item_id, "action")
+                if not bbox:
+                    continue
+                if item_id not in buttons:
+                    if spare:
+                        buttons[item_id] = spare.pop()
+                    else:
+                        create(item_id)
+                button = buttons[item_id]
+                searching = reference and item_id in self.reference_searching_items
+                button.configure(
+                    text="查找中..." if searching else "查找引用" if reference else "打开目录",
+                    state="disabled" if searching else "normal",
+                    command=(lambda item=item_id: self._click_reference_button(item)) if reference
+                            else (lambda item=item_id: self._open_directory_for_item(item)),
+                )
+                x, y, width, height = bbox
+                button_width = min(104, max(86, width - 12))
+                button_height = min(24, max(20, height - 6))
+                button.configure(width=button_width, height=button_height)
+                button.place(x=x + max(4, (width - button_width) // 2), y=y + max(3, (height - button_height) // 2))
+            for button in spare:
+                button.destroy()
+
+    def _refresh_filter_chips(self) -> None:
+        from main_layout import MODES
+        for child in self.filter_chips_frame.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(self.filter_chips_frame, text="当前条件", text_color=ui.MUTED, width=64).pack(side="left", padx=(0, 8))
+
+        def chip(text, command):
+            button = ctk.CTkButton(self.filter_chips_frame, text=text, command=command, width=20, height=27,
+                corner_radius=5, fg_color=ui.INSET_BG, hover_color=ui.HOVER_BG, text_color=ui.SELECTION_TEXT,
+                border_width=1, border_color=ui.BORDER, font=("Microsoft YaHei UI", 11))
+            button.pack(side="left", padx=(0, 8))
+            if self.search_cancel_event is not None:
+                button.configure(state="disabled")
+
+        mode = self.search_mode_var.get()
+        self.mode_display_var.set(next((label for label, value in MODES.items() if value == mode), "工作表"))
+        if mode != "JSON格式检查":
+            chip("精确匹配 ▾" if self.exact_match_var.get() else "包含匹配 ▾", lambda: self._change_filter(self.exact_match_var))
+        if mode in {"工作表检索", "单元格检索"} and self.only_enabled_sheets_var.get():
+            chip("仅启用表格 ×", lambda: self._change_filter(self.only_enabled_sheets_var, False))
+        if mode == "单元格检索":
+            if self.only_enabled_data_var.get():
+                chip("仅启用数据 ×", lambda: self._change_filter(self.only_enabled_data_var, False))
+            config = self.data_filter_config
+            if config.enable_header_filter:
+                chip(f"跳过前 {config.header_row_count} 行", self.open_settings)
+            if config.enable_blank_header_column_filter:
+                chip("屏蔽空白表头列", self.open_settings)
+        if mode == "文件检索":
+            if self.only_specified_suffixes_var.get():
+                suffix = self.file_suffixes_var.get().strip()
+                chip(f"后缀：{suffix[:24] or '未设置'} ×", lambda: self._change_filter(self.only_specified_suffixes_var, False))
+            if self.search_folders_var.get():
+                chip("包含文件夹 ×", lambda: self._change_filter(self.search_folders_var, False))
+        if mode == "JSON格式检查":
+            chip("非 $ 工作表 · 第 4、6 行识别 JSON 列", self.open_search_settings)
+        self.search_settings_button = ctk.CTkButton(self.filter_chips_frame, text="＋ 更多条件", width=90, height=27,
+            fg_color="transparent", hover_color=ui.HOVER_BG, text_color=ui.ACCENT_HOVER, command=self.open_search_settings)
+        self.search_settings_button.pack(side="left", padx=(0, 8))
+        self.reset_filters_button = ctk.CTkButton(self.filter_chips_frame, text="重置", width=44, height=27,
+            fg_color="transparent", hover_color=ui.HOVER_BG, text_color=ui.MUTED, command=self._reset_search_filters)
+        self.reset_filters_button.pack(side="left")
+        if self.search_cancel_event is not None:
+            self.search_settings_button.configure(state="disabled")
+            self.reset_filters_button.configure(state="disabled")
+
+    def _change_filter(self, variable, value=None) -> None:
+        if self.search_cancel_event is not None:
             return
+        variable.set(not variable.get() if value is None else value)
+        self._refresh_filter_chips()
+        self._save_cache_from_inputs()
+        self.status_label.configure(text="条件已更新，下次检索生效")
 
-        button_items = (*self.action_buttons.items(), *self.directory_buttons.items())
-        for item_id, button in button_items:
-            if not self.result_tree.exists(item_id):
-                button.place_forget()
-                continue
+    def _reset_search_filters(self) -> None:
+        if self.search_cancel_event is not None:
+            return
+        for variable in (self.exact_match_var, self.only_enabled_sheets_var, self.only_enabled_data_var,
+                         self.only_specified_suffixes_var, self.search_folders_var):
+            variable.set(False)
+        self._refresh_filter_chips()
+        self._save_cache_from_inputs()
+        self.status_label.configure(text="检索条件已重置，表头规则可在设置中调整")
 
-            bbox = self.result_tree.bbox(item_id, "action")
-            if not bbox:
-                button.place_forget()
-                continue
+    def _toggle_pinned_folder(self) -> None:
+        folder = self.folder_path_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            self.status_label.configure(text="先选择有效目录，再固定到历史列表顶部")
+            return
+        if folder in self.pinned_folders:
+            self.pinned_folders.remove(folder)
+        else:
+            self.pinned_folders = [folder, *self.pinned_folders][:10]
+        self._refresh_folder_history_menu()
+        self._refresh_pin_button()
+        self._save_cache_from_inputs()
 
-            x, y, width, height = bbox
-            button_width = min(104, max(86, width - 12))
-            button_height = min(24, max(20, height - 6))
-            button.configure(width=button_width, height=button_height)
-            button.place(
-                x=x + max(4, (width - button_width) // 2),
-                y=y + max(3, (height - button_height) // 2),
-            )
+    def _refresh_pin_button(self) -> None:
+        pinned = self.folder_path_var.get().strip() in self.pinned_folders
+        self.pin_folder_button.configure(text="★ 已固定" if pinned else "☆ 固定目录",
+                                         text_color="#96791e" if pinned else ui.TEXT)
+
+    def _set_density(self, _value=None) -> None:
+        ttk.Style(self).configure("Treeview", rowheight=28 if self.density_var.get() == "紧凑" else 36)
+        self._schedule_action_button_layout()
+        self._schedule_result_grid_lines()
+        self._save_cache_from_inputs()
+
+    def _toggle_preview(self) -> None:
+        self.preview_enabled = not self.preview_enabled
+        self._sync_preview_visibility()
+        self._save_cache_from_inputs()
+
+    def _sync_preview_visibility(self) -> None:
+        if self.preview_enabled:
+            self.preview_pane.grid()
+            self.preview_toggle_button.configure(text="预览 ▸")
+            self._update_selected_preview()
+        else:
+            self.preview_pane.grid_remove()
+            self.preview_pane.clear()
+            self.preview_toggle_button.configure(text="◂ 预览")
+
+    def _on_result_selected(self, _event=None) -> None:
+        selection = self.result_tree.selection()
+        if not selection:
+            self.selected_target = None
+            self.selected_value = ""
+            self.selection_label.configure(text="选择结果可查看详情")
+            self.preview_pane.clear()
+            return
+        item = selection[0]
+        target = self.item_targets.get(item)
+        if target is None:
+            return
+        self.selected_target = target
+        self.selected_value = self.item_raw_values.get(item, "\t".join(str(v) for v in self.result_tree.item(item, "values") if v))
+        self.selection_label.configure(text=(f"已选择 {format_excel_cell_address(target.row_index, target.column_index)} · {target.sheet_name}"
+                                             if target.row_index and target.column_index else f"已选择：{target.sheet_name or target.file_path.name}"))
+        self.selection_open_button.configure(text="在 Excel 中定位" if target.sheet_name else "打开文件")
+        self._update_selected_preview()
+
+    def _on_file_selected(self, result: FileSearchResult) -> None:
+        self.selected_target = ResultTarget(result.path)
+        self.selected_value = result.file_name
+        self.selection_label.configure(text=f"已选择：{result.file_name}")
+        self.selection_open_button.configure(text="打开文件夹" if result.is_directory else "打开文件")
+        self._update_selected_preview()
+
+    def _update_selected_preview(self) -> None:
+        target = self.selected_target
+        if not self.preview_enabled or target is None:
+            return
+        if target.sheet_name:
+            self.preview_pane.show_cell(target.file_path, target.sheet_name, target.row_index or 1,
+                target.column_index or 1, getattr(self, "selected_value", ""), self.current_keyword)
+        else:
+            self.preview_pane.show_file(target.file_path)
+
+    def _open_file_result(self, result: FileSearchResult) -> None:
+        self._open_target(ResultTarget(result.path))
+
+    def _open_selected_target(self) -> None:
+        if self.selected_target:
+            self._open_target(self.selected_target)
+
+    def _open_selected_directory(self) -> None:
+        if self.selected_target:
+            self._open_target(ResultTarget(self.selected_target.file_path, open_containing_folder=True))
+
+    def _copy_selected(self, kind="value") -> str:
+        target = self.selected_target
+        if target is None:
+            return "break"
+        if kind == "path":
+            value = str(target.file_path)
+        elif kind == "address":
+            if not target.row_index or not target.column_index:
+                return "break"
+            value = f"'{(target.sheet_name or '').replace(chr(39), chr(39)*2)}'!{format_excel_cell_address(target.row_index, target.column_index)}"
+        else:
+            value = getattr(self, "selected_value", "")
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.status_label.configure(text="已复制" + {"path": "文件路径", "address": "单元格地址"}.get(kind, "完整内容"))
+        return "break"
+
+    def _show_result_menu(self, event) -> str:
+        item = self.result_tree.identify_row(event.y)
+        if not item:
+            return "break"
+        self.result_tree.selection_set(item)
+        self.result_tree.focus(item)
+        self._on_result_selected()
+        self._popup_result_menu(event)
+        return "break"
+
+    def _show_file_menu(self, result, event) -> None:
+        self._on_file_selected(result)
+        self._popup_result_menu(event)
+
+    def _popup_result_menu(self, event) -> None:
+        target = self.selected_target
+        if target is None:
+            return
+        menu = Menu(self, tearoff=False, background=ui.SURFACE, foreground=ui.TEXT, activebackground=ui.HOVER_BG, activeforeground=ui.ACCENT, font=("Microsoft YaHei UI", 10))
+        menu.add_command(label="复制内容", accelerator="Ctrl+C", command=self._copy_selected)
+        if target.row_index:
+            menu.add_command(label="复制单元格地址", command=lambda: self._copy_selected("address"))
+        menu.add_command(label="复制文件路径", command=lambda: self._copy_selected("path"))
+        menu.add_separator()
+        menu.add_command(label="在 Excel 中定位" if target.sheet_name else "打开文件", accelerator="Enter", command=self._open_selected_target)
+        menu.add_command(label="打开所在目录", command=self._open_selected_directory)
+        if target.sheet_name:
+            menu.add_separator()
+            menu.add_command(label="只看此工作表", command=lambda: self._scope_to_sheet(target))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+            menu.destroy()
+
+    def _scope_to_sheet(self, target) -> None:
+        self.local_sheet_scope = (target.file_path, target.sheet_name)
+        self._apply_local_filter()
+
+    def _focus_local_filter(self, _event=None) -> str:
+        self.local_filter_entry.focus_set()
+        self.local_filter_entry.select_range(0, "end")
+        return "break"
+
+    def _reset_local_filter(self) -> str:
+        self.local_sheet_scope = None
+        self.local_filter_var.set("")
+        self._schedule_local_filter()
+        return "break"
+
+    def _schedule_local_filter(self) -> None:
+        if self.local_filter_job is not None:
+            self.after_cancel(self.local_filter_job)
+        self.local_filter_job = self.after(180, self._apply_local_filter)
+
+    def _filtered_result_source(self):
+        if self.result_source is None:
+            return None
+        kind, data = self.result_source
+        query = self.local_filter_var.get().strip().casefold()
+        scope = self.local_sheet_scope
+        if kind == "cells":
+            data = [m for m in data if (not query or query in f"{m.path} {m.sheet_name} {format_excel_cell_address(m.row_index, m.column_index)} {m.value}".casefold())
+                    and (scope is None or (m.path, m.sheet_name) == scope)]
+        elif kind == "files":
+            data = [r for r in data if not query or query in str(r.path).casefold()]
+        elif kind == "json":
+            data = replace(data, errors=[e for e in data.errors if (not query or query in f"{e.path} {e.sheet_name} {e.value} {e.message}".casefold())
+                                        and (scope is None or (e.path, e.sheet_name) == scope)])
+        return kind, data
+
+    def _apply_local_filter(self) -> None:
+        if self.local_filter_job is not None:
+            self.after_cancel(self.local_filter_job)
+        self.local_filter_job = None
+        if self.search_cancel_event is not None:
+            return
+        filtered = self._filtered_result_source()
+        if filtered is None:
+            return
+        kind, data = filtered
+        self._filter_rendering = True
+        try:
+            {"cells": self._render_cell_matches, "files": self._render_file_results,
+             "sheets": self._render_results, "json": self._render_json_validation_results}[kind](data)
+        finally:
+            self._filter_rendering = False
+
+    def _record_result_source(self, kind, data, count, summary) -> None:
+        if not self._filter_rendering:
+            self.result_source = (kind, data)
+        self.result_count_label.configure(text=f"检索结果  {count}")
+        narrowed = self.local_filter_var.get().strip() or self.local_sheet_scope
+        suffix = " · 结果内筛选中，Esc 恢复全部" if narrowed else ""
+        self.result_summary_label.configure(text=summary + suffix)
+
+    def _export_results(self) -> None:
+        from result_export import export_result_rows
+        filtered = self._filtered_result_source()
+        if filtered is None or self.search_cancel_event is not None or self.tree_render_job is not None:
+            self.status_label.configure(text="请等待检索及结果显示完成后导出")
+            return
+        destination = filedialog.asksaveasfilename(parent=self, title="导出当前筛选结果", defaultextension=".xlsx", filetypes=[("Excel 工作簿", "*.xlsx")], initialfile="检索结果.xlsx")
+        if not destination:
+            return
+        kind, data = filtered
+        headers = ("文件路径", "工作表", "单元格", "内容", "说明")
+        if kind == "cells":
+            rows = [(str(m.path), m.sheet_name, format_excel_cell_address(m.row_index, m.column_index), m.value, "") for m in data]
+        elif kind == "files":
+            rows = [(str(r.path), "", "", r.file_name, "文件夹" if r.is_directory else r.path.suffix) for r in data]
+        elif kind == "json":
+            rows = [(str(e.path), e.sheet_name, format_excel_cell_address(e.row_index, e.column_index), e.value, e.message) for e in data.errors]
+        else:
+            rows = [(str(r.path), sheet if not description else "", "", "", description or status)
+                    for r, sheet, status, description in self._worksheet_display_rows(data)]
+        self.status_label.configure(text=f"正在导出 {len(rows)} 条结果…")
+        def worker():
+            try:
+                count = export_result_rows(Path(destination), headers, rows)
+            except Exception as exc:
+                self._post_to_ui(lambda message=str(exc): messagebox.showerror("导出失败", message, parent=self))
+            else:
+                self._post_to_ui(lambda: self.status_label.configure(text=f"已导出 {count} 条结果：{destination}"))
+        Thread(target=worker, daemon=True).start()
 
     def choose_folder(self) -> None:
         """打开系统文件夹选择器，并记录选择历史。"""
@@ -959,17 +1076,30 @@ class ExcelEditApp(ctk.CTk):
     def _remember_folder_path(self, folder_path: str | Path) -> None:
         """把有效文件夹写入历史列表并刷新下拉框。"""
 
-        self.folder_history = normalize_folder_history(self.folder_history, str(folder_path))
+        updated_history = normalize_folder_history(self.folder_history, str(folder_path))
+        if updated_history == self.folder_history:
+            return
+
+        self.folder_history = updated_history
         self._refresh_folder_history_menu()
 
     def _refresh_folder_history_menu(self) -> None:
         """刷新文件夹历史下拉框中的选项。"""
 
-        self.folder_entry.configure(values=self.folder_history)
+        if self.folder_dropdown_active:
+            self.folder_history_refresh_pending = True
+            return
+
+        self.folder_entry.configure(values=list(dict.fromkeys([*self.pinned_folders, *self.folder_history])))
+        self._refresh_pin_button()
         self._sync_folder_dropdown_width()
 
     def _sync_folder_dropdown_width(self) -> None:
         """让历史下拉列表宽度尽量贴近文件夹输入框宽度。"""
+
+        if self.folder_dropdown_active:
+            self.folder_history_refresh_pending = True
+            return
 
         dropdown_menu = getattr(self.folder_entry, "_dropdown_menu", None)
         if dropdown_menu is None:
@@ -1006,7 +1136,14 @@ class ExcelEditApp(ctk.CTk):
         self.folder_entry._close_on_next_click = False
         # CustomTkinter 在 Windows 默认调用 Menu.post()，该方式没有完整的菜单抓取，
         # 点击菜单项时可能继续触发下方 Treeview。tk_popup() 会在菜单存续期间接管鼠标事件。
-        dropdown_menu.tk_popup(menu_x, menu_y)
+        self.folder_dropdown_active = True
+        try:
+            dropdown_menu.tk_popup(menu_x, menu_y)
+        finally:
+            self.folder_dropdown_active = False
+            if self.folder_history_refresh_pending and not self.is_closing:
+                self.folder_history_refresh_pending = False
+                self._refresh_folder_history_menu()
 
     def _rebuild_folder_dropdown_menu(self, target_width: int) -> None:
         """重建 CustomTkinter 下拉菜单项，让弹出的历史地址不再过窄。"""
@@ -1025,8 +1162,8 @@ class ExcelEditApp(ctk.CTk):
         spacer = "\u00a0"
         spacer_width = max(menu_font.measure(spacer), 1)
         usable_width = max(target_width - 24, 0)
-        for folder_path in self.folder_history:
-            label = folder_path
+        for folder_path in dict.fromkeys([*self.pinned_folders, *self.folder_history]):
+            label = ("★  " if folder_path in self.pinned_folders else "") + folder_path
             remaining_width = usable_width - menu_font.measure(label)
             if remaining_width > 0:
                 # 使用不可断空格撑宽菜单项，不影响回调里真正返回的文件夹路径。
@@ -1085,6 +1222,7 @@ class ExcelEditApp(ctk.CTk):
         self.reference_config = reference_config
         self.disabled_sheet_marker = disabled_sheet_marker
         self.data_filter_config = data_filter_config
+        self._refresh_filter_chips()
         self.help_url = help_url.strip()
         self._save_cache_from_inputs()
         self._refresh_sheet_statuses()
@@ -1108,12 +1246,15 @@ class ExcelEditApp(ctk.CTk):
         self.file_suffixes_var.set(file_suffixes)
         self.search_folders_var.set(search_folders)
         self.exact_match_var.set(exact_match)
+        self._refresh_filter_chips()
         self._save_cache_from_inputs()
         self.status_label.configure(text="检索设置已保存")
 
     def run_selected_search(self) -> None:
         """根据下拉框当前选项分发到对应检索功能。"""
 
+        if self.search_cancel_event is not None:
+            return
         search_mode = self.search_mode_var.get()
         if search_mode == "单元格检索":
             self.start_cell_search()
@@ -1121,13 +1262,22 @@ class ExcelEditApp(ctk.CTk):
         if search_mode == "文件检索":
             self.start_file_search()
             return
+        if search_mode == "JSON格式检查":
+            self.start_json_validation()
+            return
         self.start_scan()
 
     def _on_search_mode_changed(self, selected_mode: str) -> None:
         """切换检索类型，并同步已打开的检索设置窗口。"""
 
         self.search_mode_var.set(selected_mode)
+        self._refresh_filter_chips()
         self.search_settings_dialog.refresh(selected_mode)
+        if selected_mode == "JSON格式检查":
+            self.keyword_entry.configure(placeholder_text="JSON 格式检查无需输入内容：自动检查第 4、6 行识别出的 JSON 列")
+        else:
+            placeholders = {"工作表检索": "输入工作簿或工作表关键词 · Enter 检索", "单元格检索": "输入单元格内容 · Enter 检索", "文件检索": "输入文件名或路径关键词 · Enter 检索"}
+            self.keyword_entry.configure(placeholder_text=placeholders.get(selected_mode, "输入关键词"))
         self._save_cache_from_inputs()
 
     def start_scan(self) -> None:
@@ -1144,6 +1294,9 @@ class ExcelEditApp(ctk.CTk):
             return
 
         self.current_keyword = self.keyword_entry.get().strip()
+        if not self.current_keyword:
+            messagebox.showinfo("缺少搜索内容", "请先在输入框里填写要搜索的内容。")
+            return
         self.current_exact_match = self.exact_match_var.get()
         self._remember_folder_path(folder_path)
         self._save_cache_from_inputs()
@@ -1220,6 +1373,9 @@ class ExcelEditApp(ctk.CTk):
             return
 
         keyword = self.keyword_entry.get().strip()
+        if not keyword:
+            messagebox.showinfo("缺少搜索内容", "请先在输入框里填写要搜索的内容。")
+            return
         exact_match = self.exact_match_var.get()
         include_folders = self.search_folders_var.get()
         suffixes: tuple[str, ...] = ()
@@ -1241,6 +1397,32 @@ class ExcelEditApp(ctk.CTk):
         worker = Thread(
             target=self._search_files_in_background,
             args=(folder_path, keyword, suffixes, exact_match, include_folders, cancel_event),
+            daemon=True,
+        )
+        worker.start()
+
+    def start_json_validation(self) -> None:
+        """检查非 `$` 工作表中由第 4、6 行识别出的 JSON 数据列。"""
+
+        folder_text = self.folder_entry.get().strip()
+        if not folder_text:
+            messagebox.showinfo("缺少文件夹", "请先选择或输入一个文件夹地址。")
+            return
+
+        folder_path = Path(folder_text)
+        if not folder_path.exists() or not folder_path.is_dir():
+            messagebox.showerror("文件夹无效", "请输入有效的文件夹地址。")
+            return
+
+        self._remember_folder_path(folder_path)
+        self._save_cache_from_inputs()
+        cancel_event = self._begin_search()
+        self.status_label.configure(text="正在检查非 $ 工作表中的 JSON 数据列，请稍等")
+        self._clear_results()
+
+        worker = Thread(
+            target=self._validate_json_in_background,
+            args=(folder_path, cancel_event),
             daemon=True,
         )
         worker.start()
@@ -1269,12 +1451,14 @@ class ExcelEditApp(ctk.CTk):
     ) -> None:
         """后台执行工作表检索，并把结果切回主线程渲染。"""
 
+        tracker = self.search_tracker
         try:
             results = scan_excel_workbooks(
                 folder_path,
                 keyword,
                 cancel_event=cancel_event,
                 exact_match=exact_match,
+                tracker=tracker,
             )
         except ExcelReadError as exc:
             message = str(exc)
@@ -1289,7 +1473,7 @@ class ExcelEditApp(ctk.CTk):
             return
 
         if cancel_event.is_set():
-            self._post_search_callback(cancel_event, self._search_cancelled)
+            self._post_search_callback(cancel_event, lambda: self._search_cancelled(lambda: self._render_results(results)))
             return
         self._post_search_callback(cancel_event, lambda results=results: self._scan_finished(results))
 
@@ -1305,6 +1489,7 @@ class ExcelEditApp(ctk.CTk):
         """后台执行单元格检索，并把结果切回主线程渲染。"""
 
         issues: list[ExcelCellSearchIssue] = []
+        tracker = self.search_tracker
         try:
             matches = search_excel_cells(
                 folder_path,
@@ -1314,6 +1499,7 @@ class ExcelEditApp(ctk.CTk):
                 cancel_event=cancel_event,
                 issues=issues,
                 exact_match=exact_match,
+                tracker=tracker,
             )
         except ExcelReadError as exc:
             message = str(exc)
@@ -1328,7 +1514,7 @@ class ExcelEditApp(ctk.CTk):
             return
 
         if cancel_event.is_set():
-            self._post_search_callback(cancel_event, self._search_cancelled)
+            self._post_search_callback(cancel_event, lambda: self._search_cancelled(lambda: self._render_cell_matches(matches)))
             return
         self._post_search_callback(
             cancel_event,
@@ -1350,6 +1536,7 @@ class ExcelEditApp(ctk.CTk):
     ) -> None:
         """后台执行文件名检索，并把结果切回主线程渲染。"""
 
+        tracker = self.search_tracker
         try:
             results = search_files(
                 folder_path,
@@ -1358,6 +1545,7 @@ class ExcelEditApp(ctk.CTk):
                 suffixes=suffixes,
                 exact_match=exact_match,
                 include_folders=include_folders,
+                tracker=tracker,
             )
         except FileSearchError as exc:
             message = str(exc)
@@ -1372,17 +1560,102 @@ class ExcelEditApp(ctk.CTk):
             return
 
         if cancel_event.is_set():
-            self._post_search_callback(cancel_event, self._search_cancelled)
+            self._post_search_callback(cancel_event, lambda: self._search_cancelled(lambda: self._render_file_results(results)))
             return
         self._post_search_callback(cancel_event, lambda results=results: self._file_search_finished(results))
 
+    def _validate_json_in_background(self, folder_path: Path, cancel_event: Event) -> None:
+        """后台检查 JSON 数据列，并把错误列表切回主线程渲染。"""
+
+        tracker = self.search_tracker
+        try:
+            report = validate_excel_json_columns(
+                folder_path,
+                cancel_event=cancel_event,
+                max_errors=DEFAULT_MAX_JSON_VALIDATION_ERRORS,
+                tracker=tracker,
+            )
+        except ExcelReadError as exc:
+            message = str(exc)
+            if cancel_event.is_set():
+                self._post_search_callback(cancel_event, self._search_cancelled)
+            else:
+                self._post_search_callback(
+                    cancel_event,
+                    lambda message=message: self._json_validation_failed(message),
+                )
+            return
+        except Exception as exc:
+            message = f"发生未预期错误：{exc}"
+            self._post_search_callback(
+                cancel_event,
+                lambda message=message: self._json_validation_failed(message),
+            )
+            return
+
+        if cancel_event.is_set():
+            self._post_search_callback(cancel_event, lambda: self._search_cancelled(lambda: self._render_json_validation_results(report)))
+            return
+        self._post_search_callback(
+            cancel_event,
+            lambda report=report: self._json_validation_finished(report),
+        )
+
     def _begin_search(self) -> Event:
-        """进入检索中状态，并创建本次检索的取消事件。"""
+        """创建任务和限频进度回调，旧任务的快照不能写入新界面。"""
 
         cancel_event = Event()
         self.search_cancel_event = cancel_event
+        self.search_tracker = SearchTracker(
+            lambda snapshot: self._post_search_callback(
+                cancel_event, lambda snapshot=snapshot: self._show_search_progress(snapshot),
+            )
+        )
+        self.current_keyword = self.keyword_entry.get().strip()
+        self.current_exact_match = self.exact_match_var.get()
+        self.failure_details_button.grid_remove()
         self._set_search_controls_running(True)
         return cancel_event
+
+    def _show_search_progress(self, snapshot: SearchSnapshot) -> None:
+        if self.search_cancel_event is None or self.search_cancel_event.is_set():
+            return
+        name = Path(snapshot.current_path).name
+        if len(name) > 44:
+            name = name[:41] + "…"
+        self.status_label.configure(text=(
+            f"已扫描 {snapshot.scanned_count} 项，找到 {snapshot.result_count} 条，"
+            f"耗时 {snapshot.elapsed_seconds:.1f} 秒 · {name}"
+        ))
+
+    def _completion_status(self, text: str, limit_reached: bool = False) -> str:
+        tracker = self.search_tracker
+        parts = [text]
+        if tracker is not None:
+            snapshot = tracker.snapshot()
+            parts.append(f"已扫描 {snapshot.scanned_count} 项，耗时 {snapshot.elapsed_seconds:.1f} 秒")
+            limit_reached = snapshot.stop_reason == "limit"
+            if tracker.issues:
+                parts.append(f"跳过 {len(tracker.issues)} 处无法读取的文件或目录")
+                self.failure_details_button.configure(text=f"失败明细 ({len(tracker.issues)})")
+                self.failure_details_button.grid()
+        if limit_reached:
+            parts.append("达到结果上限，已停止检索，结果可能不完整")
+        return "；".join(parts)
+
+    def show_failure_details(self) -> None:
+        if self.search_tracker is None or not self.search_tracker.issues:
+            return
+        window = ctk.CTkToplevel(self)
+        window.title("检索失败明细")
+        window.geometry("820x480")
+        window.transient(self)
+        textbox = ctk.CTkTextbox(window, wrap="word")
+        textbox.pack(fill="both", expand=True, padx=12, pady=12)
+        textbox.insert("1.0", "\n\n".join(
+            f"{issue.path}\n{issue.message}" for issue in self.search_tracker.issues
+        ))
+        textbox.configure(state="disabled")
 
     def cancel_current_search(self) -> None:
         """响应取消按钮，请求后台线程尽快停止。"""
@@ -1395,92 +1668,101 @@ class ExcelEditApp(ctk.CTk):
             self.cancel_search_button.configure(state="disabled", text="取消中...")
         self.status_label.configure(text="正在取消检索，请稍等")
 
-    def _search_cancelled(self) -> None:
+    def _search_cancelled(self, partial_renderer: Callable[[], None] | None = None) -> None:
         """后台线程确认取消后恢复界面状态。"""
 
+        if self.search_tracker is not None:
+            self.search_tracker.finish("cancelled")
         self.search_cancel_event = None
         self._set_search_controls_running(False)
-        self.status_label.configure(text="已取消检索")
+        if partial_renderer is not None:
+            partial_renderer()
+        self.status_label.configure(text=self._completion_status("已取消检索，保留已找到的结果；结果可能不完整"))
 
     def _scan_failed(self, message: str) -> None:
         """显示工作表检索失败信息。"""
 
+        if self.search_tracker is not None:
+            self.search_tracker.finish("failed")
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self.status_label.configure(text="检索失败")
         messagebox.showerror("检索失败", message)
 
     def _scan_finished(self, results: list[ExcelWorkbookInfo]) -> None:
-        """渲染工作表检索结果并更新状态栏统计。"""
-
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_results(results)
-        if not results:
-            return
-
-        workbook_count = len(results)
         row_count = self._count_display_rows(results)
-        if row_count == 0 and self.only_enabled_sheets_var.get():
-            self.status_label.configure(text="检索完成：未找到匹配的启用工作表")
-            return
-        self.status_label.configure(text=f"检索完成：{workbook_count} 个工作簿，{row_count} 条结果")
+        self.status_label.configure(text=self._completion_status(
+            f"工作表检索完成：{len(results)} 个工作簿，{row_count} 条结果",
+        ))
 
     def _cell_search_failed(self, message: str) -> None:
         """显示单元格检索失败信息。"""
 
+        if self.search_tracker is not None:
+            self.search_tracker.finish("failed")
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self.status_label.configure(text="单元格搜索失败")
         messagebox.showerror("单元格搜索失败", message)
 
     def _cell_search_finished(
-        self,
-        matches: list[ExcelCellMatch],
-        keyword: str,
-        issues: list[ExcelCellSearchIssue],
+        self, matches: list[ExcelCellMatch], keyword: str, issues: list[ExcelCellSearchIssue],
     ) -> None:
-        """渲染单元格检索结果并更新状态栏统计。"""
-
+        self.current_keyword = keyword
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_cell_matches(matches)
-        status_parts = [f"找到 {len(matches)} 条匹配"]
-        if len(matches) >= DEFAULT_MAX_SEARCH_RESULTS:
-            status_parts.append(f"已达到显示上限 {DEFAULT_MAX_SEARCH_RESULTS} 条")
-        if issues:
-            status_parts.append(f"跳过 {len(issues)} 个无法读取的文件")
-        self.status_label.configure(text="单元格搜索完成：" + "，".join(status_parts))
+        self.status_label.configure(text=self._completion_status(f"单元格检索完成：找到 {len(matches)} 条匹配"))
 
     def _file_search_failed(self, message: str) -> None:
         """显示文件检索失败信息。"""
 
+        if self.search_tracker is not None:
+            self.search_tracker.finish("failed")
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self.status_label.configure(text="文件检索失败")
         messagebox.showerror("文件检索失败", message)
 
     def _file_search_finished(self, results: list[FileSearchResult]) -> None:
-        """渲染文件检索结果并更新状态栏统计。"""
-
         self.search_cancel_event = None
         self._set_search_controls_running(False)
         self._render_file_results(results)
         file_count = sum(not result.is_directory for result in results)
         folder_count = sum(result.is_directory for result in results)
-        limit_text = (
-            f"，已达到显示上限 {DEFAULT_MAX_FILE_SEARCH_RESULTS} 条"
-            if len(results) >= DEFAULT_MAX_FILE_SEARCH_RESULTS
-            else ""
-        )
-        count_text = f"{file_count} 个文件"
+        count_text = f"文件检索完成：找到 {file_count} 个文件"
         if folder_count:
             count_text += f"，{folder_count} 个文件夹"
-        self.status_label.configure(text=f"文件检索完成：找到 {count_text}{limit_text}")
+        self.status_label.configure(text=self._completion_status(count_text))
+
+    def _json_validation_failed(self, message: str) -> None:
+        """显示 JSON 格式检查失败信息。"""
+
+        if self.search_tracker is not None:
+            self.search_tracker.finish("failed")
+        self.search_cancel_event = None
+        self._set_search_controls_running(False)
+        self.status_label.configure(text="JSON 格式检查失败")
+        messagebox.showerror("JSON 格式检查失败", message)
+
+    def _json_validation_finished(self, report: JsonValidationReport) -> None:
+        self.search_cancel_event = None
+        self._set_search_controls_running(False)
+        self._render_json_validation_results(report)
+        text = (
+            f"JSON 检查完成：识别 {report.json_column_count} 列，检查 {report.checked_cell_count} 个单元格，"
+            f"发现 {len(report.errors)} 处格式错误"
+        )
+        self.status_label.configure(text=self._completion_status(text, report.limit_reached))
 
     def _set_search_controls_running(self, is_running: bool) -> None:
         """切换检索中/空闲状态下按钮和选项的可用性。"""
 
+        self._refresh_filter_chips()
+        self.local_filter_entry.configure(state="disabled" if is_running else "normal")
         if is_running:
             self.search_settings_dialog.close()
             self.run_search_button.configure(state="disabled", text="检索中...")
@@ -1503,15 +1785,46 @@ class ExcelEditApp(ctk.CTk):
         if self.search_settings_button is not None:
             self.search_settings_button.configure(state="normal")
 
+    def _cancel_tree_render(self) -> None:
+        self.tree_render_serial += 1
+        if self.tree_render_job is not None:
+            self.after_cancel(self.tree_render_job)
+            self.tree_render_job = None
+
+    def _render_tree_rows(self, rows: Iterator[None]) -> None:
+        self._cancel_tree_render()
+        serial = self.tree_render_serial
+
+        def insert_batch() -> None:
+            self.tree_render_job = None
+            if self.is_closing or serial != self.tree_render_serial:
+                return
+            deadline = perf_counter() + 0.008
+            for _ in range(200):
+                try:
+                    next(rows)
+                except StopIteration:
+                    self._update_result_group_controls_visibility()
+                    self._schedule_action_button_layout()
+                    return
+                if perf_counter() >= deadline:
+                    break
+            self._schedule_action_button_layout()
+            self.tree_render_job = self.after(1, insert_batch)
+
+        insert_batch()
+
     def _render_cell_matches(self, matches: list[ExcelCellMatch]) -> None:
         """按工作簿、工作表两级目录展示单元格命中。"""
 
         self._clear_results()
+        self._record_result_source("cells", list(matches), len(matches),
+            f"{len({m.path for m in matches})} 个工作簿 · {len({(m.path, m.sheet_name) for m in matches})} 张工作表")
         self._show_table_results()
         self._configure_result_columns(
             CELL_RESULT_COLUMNS,
-            tree_heading="检索目录",
-            tree_width=360,
+            tree_heading="工作簿 / 工作表 / 位置",
+            tree_width=260,
             tree_min_width=180,
             tree_stretch=True,
         )
@@ -1520,57 +1833,104 @@ class ExcelEditApp(ctk.CTk):
         for match in matches:
             matches_by_workbook.setdefault(match.path, []).append(match)
 
-        for workbook_path, workbook_matches in matches_by_workbook.items():
-            # 工作簿和工作表都是分类目录；只有具体单元格命中行会打开 Excel。
-            workbook_item_id = self.result_tree.insert(
-                "",
-                "end",
-                text=workbook_path.name,
-                values=(f"{len(workbook_matches)} 条匹配", ""),
-                open=True,
-                tags=("cell-workbook",),
-            )
-            self.item_targets[workbook_item_id] = ResultTarget(workbook_path)
-            self._create_directory_button(workbook_item_id)
-
-            matches_by_sheet: dict[str, list[ExcelCellMatch]] = {}
-            for match in workbook_matches:
-                matches_by_sheet.setdefault(match.sheet_name, []).append(match)
-
-            for sheet_name, sheet_matches in matches_by_sheet.items():
-                sheet_item_id = self.result_tree.insert(
-                    workbook_item_id,
+        def rows() -> Iterator[None]:
+            for workbook_path, workbook_matches in matches_by_workbook.items():
+                # 工作簿和工作表都是分类目录；只有具体单元格命中行会打开 Excel。
+                workbook_item_id = self.result_tree.insert(
+                    "",
                     "end",
-                    text=sheet_name,
-                    values=(f"{len(sheet_matches)} 条匹配", ""),
+                    text=workbook_path.name,
+                    values=(f"{len(workbook_matches)} 条匹配", ""),
                     open=True,
-                    tags=("cell-sheet",),
+                    tags=("cell-workbook",),
                 )
-                self.item_targets[sheet_item_id] = ResultTarget(workbook_path, sheet_name)
+                self.item_targets[workbook_item_id] = ResultTarget(workbook_path)
+                self.directory_item_ids.add(workbook_item_id)
 
-                for match in sheet_matches:
-                    item_id = self.result_tree.insert(
-                        sheet_item_id,
+                matches_by_sheet: dict[str, list[ExcelCellMatch]] = {}
+                for match in workbook_matches:
+                    matches_by_sheet.setdefault(match.sheet_name, []).append(match)
+
+                for sheet_name, sheet_matches in matches_by_sheet.items():
+                    sheet_item_id = self.result_tree.insert(
+                        workbook_item_id,
                         "end",
-                        text=format_excel_cell_address(match.row_index, match.column_index),
-                        values=(
-                            format_cell_value(match.value),
-                            "",
-                        ),
+                        text=sheet_name,
+                        values=(f"{len(sheet_matches)} 条匹配", ""),
+                        open=True,
+                        tags=("cell-sheet",),
                     )
-                    self.item_targets[item_id] = ResultTarget(
-                        match.path,
-                        match.sheet_name,
-                        match.row_index,
-                        match.column_index,
-                    )
+                    self.item_targets[sheet_item_id] = ResultTarget(workbook_path, sheet_name)
+
+                    for match in sheet_matches:
+                        item_id = self.result_tree.insert(
+                            sheet_item_id,
+                            "end",
+                            text=format_excel_cell_address(match.row_index, match.column_index),
+                            values=(
+                                format_cell_value(match.value),
+                                "",
+                            ),
+                        )
+                        self.item_targets[item_id] = ResultTarget(
+                            match.path,
+                            match.sheet_name,
+                            match.row_index,
+                            match.column_index,
+                        )
+                        self.item_raw_values[item_id] = str(match.value)
+                        yield
+
+        self._render_tree_rows(rows())
+        self._update_result_group_controls_visibility()
+        self._schedule_action_button_layout()
+
+    def _render_json_validation_results(self, report: JsonValidationReport) -> None:
+        """以表格展示 JSON 格式错误；双击错误行可打开并定位到对应单元格。"""
+
+        self._clear_results()
+        self._record_result_source("json", report, len(report.errors), f"检查 {report.checked_cell_count} 个单元格 · JSON 格式错误")
+        self._show_table_results()
+        self._configure_result_columns(
+            JSON_RESULT_COLUMNS,
+            tree_heading="工作簿",
+            tree_width=260,
+            tree_min_width=180,
+            tree_stretch=True,
+        )
+
+        def rows() -> Iterator[None]:
+            for error in report.errors:
+                item_id = self.result_tree.insert(
+                    "",
+                    "end",
+                    text=error.workbook_name,
+                    values=(
+                        error.sheet_name,
+                        format_excel_cell_address(error.row_index, error.column_index),
+                        format_cell_value(error.value),
+                        error.message,
+                    ),
+                )
+                self.item_targets[item_id] = ResultTarget(
+                    error.path,
+                    error.sheet_name,
+                    error.row_index,
+                    error.column_index,
+                )
+                self.item_raw_values[item_id] = str(error.value)
+                yield
+
+        self._render_tree_rows(rows())
         self._update_result_group_controls_visibility()
         self._schedule_action_button_layout()
 
     def _render_file_results(self, results: list[FileSearchResult]) -> None:
         """保存文件检索结果，并按当前视图渲染。"""
 
+        results = list(results)
         self._clear_results()
+        self._record_result_source("files", results, len(results), f"{sum(not r.is_directory for r in results)} 个文件 · {sum(r.is_directory for r in results)} 个文件夹")
         self.file_thumbnail_results = list(results)
         self._render_file_result_view()
 
@@ -1580,9 +1940,10 @@ class ExcelEditApp(ctk.CTk):
     def _on_file_result_view_changed(self, _selected_view: str) -> None:
         """在缩略图和表格之间切换当前文件检索结果。"""
 
-        if self.search_mode_var.get() != "文件检索":
+        if self.result_source is None or self.result_source[0] != "files":
             return
         self._render_file_result_view()
+        self._save_cache_from_inputs()
 
     def _render_file_result_view(self) -> None:
         """清理旧视图后，以用户选定方式展示完整文件结果。"""
@@ -1601,64 +1962,23 @@ class ExcelEditApp(ctk.CTk):
     def _clear_file_result_view(self) -> None:
         """清空文件视图的卡片、表格行和临时打开目标。"""
 
+        self._cancel_tree_render()
         self.result_group_controls.grid_remove()
         self._clear_file_thumbnail_cards()
         self.item_targets.clear()
-        for item_id in self.result_tree.get_children():
-            self.result_tree.delete(item_id)
+        self.item_raw_values.clear()
+        self.selected_target = None
+        self.selected_value = ""
+        self.selection_label.configure(text="选择结果可查看详情")
+        self.preview_pane.clear()
+        items = self.result_tree.get_children()
+        if items:
+            self.result_tree.delete(*items)
 
     def _render_file_results_as_thumbnails(self) -> None:
-        """按所在文件夹分组，并将每组完整展示在标题下方。"""
+        """按逻辑位置展示全部分组，只绘制当前视口的卡片。"""
 
-        grouped_results = self._group_file_results_by_folder()
-        if not grouped_results:
-            empty_label = ctk.CTkLabel(
-                self.file_thumbnail_frame,
-                text="没有找到匹配的文件或文件夹",
-                text_color=THUMBNAIL_TEXT_COLOR,
-                font=("Microsoft YaHei UI", 14),
-            )
-            empty_label.grid(
-                row=0,
-                column=0,
-                columnspan=FILE_THUMBNAIL_COLUMNS,
-                padx=16,
-                pady=28,
-            )
-            return
-
-        for group_index, (folder_path, folder_results) in enumerate(grouped_results.items()):
-            folder_label = ctk.CTkLabel(
-                self.file_thumbnail_frame,
-                text=f"📁  {folder_path}  ·  {len(folder_results)} 项",
-                anchor="w",
-                text_color=THUMBNAIL_TEXT_COLOR,
-                font=("Microsoft YaHei UI", 12, "bold"),
-            )
-            folder_label.grid(
-                row=group_index * 2,
-                column=0,
-                columnspan=FILE_THUMBNAIL_COLUMNS,
-                padx=10,
-                pady=(18 if group_index else 8, 2),
-                sticky="ew",
-            )
-            section_frame = ctk.CTkFrame(
-                self.file_thumbnail_frame,
-                fg_color=THUMBNAIL_BACKGROUND_COLOR,
-            )
-            section_frame.grid(
-                row=group_index * 2 + 1,
-                column=0,
-                columnspan=FILE_THUMBNAIL_COLUMNS,
-                padx=2,
-                pady=(0, 4),
-                sticky="ew",
-            )
-            for column_index in range(FILE_THUMBNAIL_COLUMNS):
-                section_frame.grid_columnconfigure(column_index, weight=1, uniform="file-thumbnail")
-            for card_index, result in enumerate(folder_results):
-                self._create_file_thumbnail_card(section_frame, result, card_index)
+        self.file_thumbnail_frame.set_results(self.file_thumbnail_results)
 
     def _render_file_results_as_table(self) -> None:
         """按所在文件夹分组，以左对齐表格展示文件结果。"""
@@ -1674,27 +1994,31 @@ class ExcelEditApp(ctk.CTk):
         if not grouped_results:
             return
 
-        for folder_path, folder_results in grouped_results.items():
-            folder_item_id = self.result_tree.insert(
-                "",
-                "end",
-                text=str(folder_path),
-                values=("", "", f"{len(folder_results)} 项"),
-                open=True,
-            )
-            self.item_targets[folder_item_id] = ResultTarget(folder_path)
-            for result in folder_results:
-                item_type = self._get_file_thumbnail_style(result)[2]
-                item_id = self.result_tree.insert(
-                    folder_item_id,
+        def rows() -> Iterator[None]:
+            for folder_path, folder_results in grouped_results.items():
+                folder_item_id = self.result_tree.insert(
+                    "",
                     "end",
-                    text="",
-                    values=(result.file_name, item_type, str(result.path)),
+                    text=str(folder_path),
+                    values=("", "", f"{len(folder_results)} 项"),
+                    open=True,
                 )
-                self.item_targets[item_id] = ResultTarget(
-                    result.path,
-                    open_containing_folder=not result.is_directory,
-                )
+                self.item_targets[folder_item_id] = ResultTarget(folder_path)
+                for result in folder_results:
+                    item_type = self._get_file_thumbnail_style(result)[2]
+                    item_id = self.result_tree.insert(
+                        folder_item_id,
+                        "end",
+                        text="",
+                        values=(result.file_name, item_type, str(result.path)),
+                    )
+                    self.item_targets[item_id] = ResultTarget(
+                        result.path,
+                    )
+                    self.item_raw_values[item_id] = result.file_name
+                    yield
+
+        self._render_tree_rows(rows())
         self._update_result_group_controls_visibility()
 
     def _group_file_results_by_folder(self) -> dict[Path, list[FileSearchResult]]:
@@ -1706,129 +2030,10 @@ class ExcelEditApp(ctk.CTk):
         return grouped_results
 
     def _clear_file_thumbnail_cards(self) -> None:
-        """删除缩略图卡片，释放图片和控件引用。"""
+        """清空虚拟视图并作废后台图片任务。"""
 
-        for widget in self.file_thumbnail_frame.winfo_children():
-            widget.destroy()
-        self.file_thumbnail_cards.clear()
+        self.file_thumbnail_frame.clear()
         self.file_thumbnail_images.clear()
-
-    def _create_file_thumbnail_card(
-        self,
-        parent: ctk.CTkFrame,
-        result: FileSearchResult,
-        card_index: int,
-    ) -> None:
-        """创建单个文件或文件夹的缩略图卡片。"""
-
-        symbol, color, item_type = self._get_file_thumbnail_style(result)
-        target = ResultTarget(
-            result.path,
-            open_containing_folder=not result.is_directory,
-        )
-        card = ctk.CTkFrame(
-            parent,
-            width=FILE_THUMBNAIL_CARD_WIDTH,
-            height=FILE_THUMBNAIL_CARD_HEIGHT,
-            fg_color=THUMBNAIL_BACKGROUND_COLOR,
-            border_width=1,
-            border_color="#e5e7eb",
-        )
-        card.grid(
-            row=card_index // FILE_THUMBNAIL_COLUMNS,
-            column=card_index % FILE_THUMBNAIL_COLUMNS,
-            padx=8,
-            pady=8,
-            sticky="nsew",
-        )
-        card.grid_propagate(False)
-        card.grid_columnconfigure(1, weight=1)
-
-        image_thumbnail = self._create_image_thumbnail(result.path)
-        if image_thumbnail is not None:
-            icon_label = ctk.CTkLabel(
-                card,
-                text="",
-                image=image_thumbnail,
-                width=64,
-                height=64,
-                corner_radius=16,
-                fg_color=THUMBNAIL_BACKGROUND_COLOR,
-            )
-            self.file_thumbnail_images.append(image_thumbnail)
-        else:
-            icon_label = ctk.CTkLabel(
-                card,
-                text=symbol,
-                width=64,
-                height=64,
-                corner_radius=16,
-                fg_color=THUMBNAIL_BACKGROUND_COLOR,
-                text_color=color,
-                font=("Segoe UI Emoji", 32),
-            )
-        icon_label.grid(row=0, column=0, rowspan=2, padx=(12, 10), pady=(12, 8), sticky="nw")
-
-        name_label = ctk.CTkLabel(
-            card,
-            text=self._shorten_thumbnail_text(result.file_name, 24),
-            anchor="w",
-            text_color=THUMBNAIL_TEXT_COLOR,
-            font=("Microsoft YaHei UI", 12, "bold"),
-        )
-        name_label.grid(row=0, column=1, padx=(0, 12), pady=(14, 0), sticky="ew")
-        type_label = ctk.CTkLabel(
-            card,
-            text=item_type,
-            anchor="w",
-            text_color=THUMBNAIL_SECONDARY_TEXT_COLOR,
-            font=("Microsoft YaHei UI", 10),
-        )
-        type_label.grid(row=1, column=1, padx=(0, 12), pady=(0, 8), sticky="ew")
-
-        location = result.path if result.is_directory else result.path.parent
-        location_label = ctk.CTkLabel(
-            card,
-            text=self._shorten_thumbnail_text(str(location), 40),
-            anchor="w",
-            text_color=THUMBNAIL_SECONDARY_TEXT_COLOR,
-            font=("Microsoft YaHei UI", 10),
-        )
-        location_label.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="ew")
-
-        open_button = ctk.CTkButton(
-            card,
-            text="打开文件夹" if result.is_directory else "打开所在目录",
-            height=28,
-            command=lambda target=target: self._open_target(target),
-        )
-        open_button.grid(row=3, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="ew")
-        self.file_thumbnail_cards.append(card)
-
-    def _create_image_thumbnail(self, file_path: Path) -> ctk.CTkImage | None:
-        """读取常见图片文件，生成等比例真实预览缩略图。"""
-
-        if file_path.suffix.lower() not in IMAGE_FILE_SUFFIXES:
-            return None
-        try:
-            with Image.open(file_path) as source_image:
-                source_image.thumbnail(FILE_THUMBNAIL_IMAGE_SIZE, Image.Resampling.LANCZOS)
-                preview_image = source_image.convert("RGBA")
-        except (OSError, UnidentifiedImageError, ValueError):
-            return None
-        return ctk.CTkImage(
-            light_image=preview_image,
-            dark_image=preview_image,
-            size=preview_image.size,
-        )
-
-    @staticmethod
-    def _shorten_thumbnail_text(value: str, max_length: int) -> str:
-        """让缩略图卡片中的文件名和路径保持单行可读。"""
-
-        if len(value) <= max_length:
-            return value
-        return value[: max_length - 1] + "…"
 
     @staticmethod
     def _get_file_thumbnail_style(result: FileSearchResult) -> tuple[str, str, str]:
@@ -1841,7 +2046,7 @@ class ExcelEditApp(ctk.CTk):
         if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".xlsb", ".csv"}:
             return "📊", "#217346", "Excel / 表格文件"
         if suffix in {".doc", ".docx", ".rtf", ".txt", ".md", ".pdf"}:
-            return "📄", "#2563eb", "文档"
+            return "📄", ui.ACCENT, "文档"
         if suffix in IMAGE_FILE_SUFFIXES or suffix == ".svg":
             return "🖼", "#7c3aed", "图片"
         if suffix in {".mp4", ".avi", ".mkv", ".mov", ".wmv"}:
@@ -1850,7 +2055,7 @@ class ExcelEditApp(ctk.CTk):
             return "🎵", "#0f766e", "音频"
         if suffix in {".zip", ".rar", ".7z", ".tar", ".gz"}:
             return "🗜", "#92400e", "压缩包"
-        return "📄", "#475569", "文件"
+        return "📄", ui.TEXT, "文件"
 
     def collapse_all_results(self) -> None:
         """一键收起结果列表中的所有分组。"""
@@ -1966,6 +2171,27 @@ class ExcelEditApp(ctk.CTk):
     def _clear_results(self) -> None:
         """清空表格或缩略图结果、行目标映射和悬浮操作按钮。"""
 
+        self._cancel_tree_render()
+        if self.local_filter_job is not None:
+            self.after_cancel(self.local_filter_job)
+            self.local_filter_job = None
+        self.selected_target = None
+        self.selected_value = ""
+        self.preview_pane.clear()
+        self.selection_label.configure(text="选择结果可查看详情")
+        self.item_raw_values.clear()
+        if not self._filter_rendering:
+            self.result_source = None
+            self.local_sheet_scope = None
+            if self.local_filter_var.get():
+                self.local_filter_var.set("")
+                if self.local_filter_job is not None:
+                    self.after_cancel(self.local_filter_job)
+                    self.local_filter_job = None
+            self.result_count_label.configure(text="检索结果  0")
+            self.result_summary_label.configure(text="等待检索结果…" if self.search_cancel_event else "选择目录，输入关键词即可开始")
+        self.action_item_ids.clear()
+        self.directory_item_ids.clear()
         self.result_group_controls.grid_remove()
         self._hide_result_grid_lines()
         self.file_thumbnail_results.clear()
@@ -1983,64 +2209,30 @@ class ExcelEditApp(ctk.CTk):
         for button in self.directory_buttons.values():
             button.destroy()
         self.directory_buttons.clear()
-        for item in self.result_tree.get_children():
-            self.result_tree.delete(item)
+        items = self.result_tree.get_children()
+        if items:
+            self.result_tree.delete(*items)
 
     def _render_results(self, results: list[ExcelWorkbookInfo]) -> None:
-        """展示工作表检索结果，每个工作表一行并附带查找引用按钮。"""
-
+        """工作表渲染、结果计数和导出共用同一份可见行规则。"""
         self._clear_results()
+        if not self._filter_rendering:
+            self.result_sheet_enabled_only = self.only_enabled_sheets_var.get()
+            self.result_disabled_marker = self.disabled_sheet_marker
+        self._record_result_source("sheets", list(results), self._count_display_rows(results), f"{len(results)} 个工作簿 · 工作表结果")
         self._show_table_results()
         self._configure_result_columns(WORKSHEET_RESULT_COLUMNS)
 
-        if not results:
-            self.status_label.configure(text="没有找到匹配的 Excel 文件")
-            return
-
-        has_display_rows = False
-        for result in results:
-            if result.error:
-                item = self.result_tree.insert(
-                    "",
-                    "end",
-                    values=(result.workbook_name, "无法读取", "读取失败", ""),
-                )
-                self.item_targets[item] = ResultTarget(result.path)
-                has_display_rows = True
-                continue
-
-            sheet_names = self._get_display_sheet_names(result)
-            if not sheet_names:
-                if self.only_enabled_sheets_var.get():
-                    continue
-                item = self.result_tree.insert(
-                    "",
-                    "end",
-                    values=(result.workbook_name, "无匹配工作表", "", ""),
-                )
-                self.item_targets[item] = ResultTarget(result.path)
-                has_display_rows = True
-                continue
-
-            for sheet_name in sheet_names:
-                # 工作表结果行可双击打开指定工作表，也可点击按钮查找引用。
-                item = self.result_tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        result.workbook_name,
-                        sheet_name,
-                        get_sheet_enabled_status(sheet_name, self.disabled_sheet_marker),
-                        "",
-                    ),
-                )
-                self.item_targets[item] = ResultTarget(result.path, sheet_name)
-                self._create_action_button(item)
-                has_display_rows = True
-
-        if not has_display_rows:
-            self.status_label.configure(text="没有找到匹配的启用工作表")
-        self._schedule_action_button_layout()
+        def rows() -> Iterator[None]:
+            for result, sheet, status, description in self._worksheet_display_rows(results):
+                item = self.result_tree.insert("", "end", values=(result.workbook_name, sheet, status, ""))
+                valid_sheet = not description
+                self.item_targets[item] = ResultTarget(result.path, sheet if valid_sheet else None)
+                self.item_raw_values[item] = description or sheet
+                if valid_sheet:
+                    self.action_item_ids.add(item)
+                yield
+        self._render_tree_rows(rows())
 
     def _handle_result_click(self, event: object) -> str | None:
         """处理单击事件，按行类型执行引用查找或打开目录。"""
@@ -2052,7 +2244,7 @@ class ExcelEditApp(ctk.CTk):
         item_id = self.result_tree.identify_row(event.y)
         if not item_id:
             return "break"
-        if item_id in self.directory_buttons:
+        if item_id in self.directory_item_ids:
             self.result_tree.selection_set(item_id)
             self.result_tree.focus(item_id)
             self._open_directory_for_item(item_id)
@@ -2074,7 +2266,7 @@ class ExcelEditApp(ctk.CTk):
             if item_id:
                 self.result_tree.selection_set(item_id)
                 self.result_tree.focus(item_id)
-                if item_id in self.directory_buttons:
+                if item_id in self.directory_item_ids:
                     self._open_directory_for_item(item_id)
                 else:
                     self._find_references_for_item(item_id)
@@ -2274,12 +2466,10 @@ class ExcelEditApp(ctk.CTk):
     def _action_button_is_available(self, item_id: str) -> bool:
         """判断工作表行对应的查找引用按钮当前是否可用。"""
 
-        button = self.action_buttons.get(item_id)
         return (
-            button is not None
+            item_id in self.action_item_ids
             and self.result_tree.exists(item_id)
             and item_id not in self.reference_searching_items
-            and str(button.cget("state")) != "disabled"
         )
 
     def _refresh_sheet_statuses(self) -> None:
@@ -2297,25 +2487,41 @@ class ExcelEditApp(ctk.CTk):
             values = list(self.result_tree.item(item_id, "values"))
             if status_index >= len(values):
                 continue
-            values[status_index] = get_sheet_enabled_status(target.sheet_name, self.disabled_sheet_marker)
+            values[status_index] = get_sheet_enabled_status(target.sheet_name, self.result_disabled_marker)
             self.result_tree.item(item_id, values=values)
 
     def _count_display_rows(self, results: list[ExcelWorkbookInfo]) -> int:
         """统计工作表检索完成后实际展示的行数。"""
 
-        row_count = 0
+        return sum(1 for _ in self._worksheet_display_rows(results))
+
+    def _worksheet_display_rows(self, results):
+        query = self.local_filter_var.get().strip().casefold()
         for result in results:
             if result.error:
-                row_count += 1
+                if self.local_sheet_scope is None and (not query or query in f"{result.path} {result.error}".casefold()):
+                    yield result, "无法读取", "读取失败", result.error
                 continue
-            sheet_count = len(self._get_display_sheet_names(result))
-            if sheet_count:
-                row_count += sheet_count
-            elif not self.only_enabled_sheets_var.get():
-                row_count += 1
-        return row_count
+            names = self._get_display_sheet_names(result)
+            if names:
+                for name in names:
+                    yield result, name, get_sheet_enabled_status(name, self.result_disabled_marker), ""
+            elif not self.result_sheet_enabled_only and not query and self.local_sheet_scope is None:
+                yield result, "无匹配工作表", "", "无匹配工作表"
 
     def _get_display_sheet_names(self, result: ExcelWorkbookInfo) -> list[str]:
+        names = self._get_search_sheet_names(result)
+        scope = self.local_sheet_scope
+        if scope is not None:
+            if result.path != scope[0]:
+                return []
+            names = [name for name in names if name == scope[1]]
+        query = self.local_filter_var.get().strip().casefold()
+        if query and query not in str(result.path).casefold():
+            names = [name for name in names if query in name.casefold()]
+        return names
+
+    def _get_search_sheet_names(self, result: ExcelWorkbookInfo) -> list[str]:
         """按关键词和启用状态计算某个工作簿需要展示的工作表。"""
 
         keyword = self.current_keyword.lower()
@@ -2340,12 +2546,12 @@ class ExcelEditApp(ctk.CTk):
     def _filter_enabled_sheet_names(self, sheet_names: list[str]) -> list[str]:
         """在勾选“仅检索启用表格”时过滤掉未启用工作表。"""
 
-        if not self.only_enabled_sheets_var.get():
+        if not self.result_sheet_enabled_only:
             return sheet_names
         return [
             sheet_name
             for sheet_name in sheet_names
-            if get_sheet_enabled_status(sheet_name, self.disabled_sheet_marker) == "启用"
+            if get_sheet_enabled_status(sheet_name, self.result_disabled_marker) == "启用"
         ]
 
     def open_selected_item(self) -> None:
@@ -2361,6 +2567,10 @@ class ExcelEditApp(ctk.CTk):
         """启动时读取上次文件夹、关键词、历史地址和设置。"""
 
         cache_data = load_cache_data()
+        self.pinned_folders = normalize_folder_history(cache_data.get("pinned_folders"))[:10]
+        self.preview_enabled = cache_data.get("preview_enabled", True) is not False
+        self.density_var.set("紧凑" if cache_data.get("result_density") == "紧凑" else "舒适")
+        self.file_result_view_var.set("表格" if cache_data.get("file_result_view") == "表格" else "缩略图")
         folder_path = cache_data.get("folder_path", "")
         folder_history = cache_data.get("folder_history", [])
         keyword = cache_data.get("keyword", "")
@@ -2394,7 +2604,13 @@ class ExcelEditApp(ctk.CTk):
         if folder_path:
             self.folder_path_var.set(folder_path)
         if keyword:
+            self.keyword_entry.delete(0, "end")
             self.keyword_entry.insert(0, keyword)
+
+        self._refresh_pin_button()
+        self._refresh_filter_chips()
+        ttk.Style(self).configure("Treeview", rowheight=28 if self.density_var.get() == "紧凑" else 36)
+        self._sync_preview_visibility()
 
         if folder_path or keyword:
             self.status_label.configure(text="已加载上次选择的地址和输入内容")
@@ -2410,6 +2626,10 @@ class ExcelEditApp(ctk.CTk):
             {
                 "folder_path": folder_path,
                 "folder_history": self.folder_history,
+                "pinned_folders": self.pinned_folders,
+                "preview_enabled": self.preview_enabled,
+                "result_density": self.density_var.get(),
+                "file_result_view": self.file_result_view_var.get(),
                 "keyword": self.keyword_entry.get().strip(),
                 "reference_config": self.reference_config,
                 "disabled_sheet_marker": self.disabled_sheet_marker,
@@ -2428,25 +2648,33 @@ class ExcelEditApp(ctk.CTk):
             self.status_label.configure(text="缓存保存失败，请检查当前用户目录权限")
 
     def close_app(self) -> None:
-        """关闭应用前请求取消后台检索并保存当前输入。"""
+        """先取消任务再销毁窗口；关闭时不再刷新预览控件。"""
 
         if self.is_closing:
             return
         self.is_closing = True
-        if self.search_cancel_event is not None:
-            self.search_cancel_event.set()
-        for cancel_event in self.reference_cancel_events.values():
-            cancel_event.set()
-        self.reference_cancel_events.clear()
-        if self.ui_poll_job is not None:
+        try:
+            self._cancel_tree_render()
+            if self.search_cancel_event is not None:
+                self.search_cancel_event.set()
+            for cancel_event in self.reference_cancel_events.values():
+                cancel_event.set()
+            self.reference_cancel_events.clear()
+            if self.ui_poll_job is not None:
+                try:
+                    self.after_cancel(self.ui_poll_job)
+                except Exception:
+                    pass
+                self.ui_poll_job = None
+            self.search_settings_dialog.close()
+            self._save_cache_from_inputs()
+        finally:
             try:
-                self.after_cancel(self.ui_poll_job)
-            except Exception:
-                pass
-            self.ui_poll_job = None
-        self.search_settings_dialog.close()
-        self._save_cache_from_inputs()
-        self.destroy()
+                for job in self.tk.call("after", "info"):
+                    self.tk.call("after", "cancel", job)
+            finally:
+                # 子组件的 destroy 负责停止工作线程和释放图片；不再调用 clear。
+                self.destroy()
 
 
 def load_cache_data() -> dict[str, object]:
@@ -2463,6 +2691,10 @@ def load_cache_data() -> dict[str, object]:
     background_image_path = raw_data.get("background_image_path", "")
     file_suffixes = raw_data.get("file_suffixes", "")
     return {
+        "pinned_folders": normalize_folder_history(raw_data.get("pinned_folders"))[:10],
+        "preview_enabled": raw_data.get("preview_enabled", True) is not False,
+        "result_density": "紧凑" if raw_data.get("result_density") == "紧凑" else "舒适",
+        "file_result_view": "表格" if raw_data.get("file_result_view") == "表格" else "缩略图",
         "folder_path": folder_path if isinstance(folder_path, str) else "",
         "folder_history": normalize_folder_history(
             raw_data.get("folder_history"),
@@ -2500,6 +2732,10 @@ def save_cache_data(cache_data: dict[str, object]) -> bool:
         data_filter_config = DEFAULT_DATA_FILTER_CONFIG
 
     updates: dict[str, object] = {
+        "pinned_folders": normalize_folder_history(cache_data.get("pinned_folders"))[:10],
+        "preview_enabled": cache_data.get("preview_enabled", True) is not False,
+        "result_density": "紧凑" if cache_data.get("result_density") == "紧凑" else "舒适",
+        "file_result_view": "表格" if cache_data.get("file_result_view") == "表格" else "缩略图",
         "folder_path": str(cache_data.get("folder_path", "")),
         "folder_history": normalize_folder_history(cache_data.get("folder_history")),
         "keyword": str(cache_data.get("keyword", "")),

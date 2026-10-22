@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 from openpyxl import load_workbook
 from xlsxwriter import Workbook
+from search_status import SearchTracker
 
 
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".xlsb"}
@@ -44,7 +45,7 @@ def get_sheet_names(file_path: str | Path) -> list[str]:
     raise ExcelReadError(f"Unsupported Excel file type: {path.suffix}")
 
 
-def iter_excel_files(folder_path: str | Path, cancel_event: object | None = None) -> Iterator[Path]:
+def iter_excel_files(folder_path: str | Path, cancel_event: object | None = None, tracker: SearchTracker | None = None) -> Iterator[Path]:
     """递归枚举文件夹内所有支持的 Excel 文件，并支持外部取消。"""
 
     folder = validate_excel_folder(folder_path)
@@ -57,7 +58,9 @@ def iter_excel_files(folder_path: str | Path, cancel_event: object | None = None
         try:
             with os.scandir(current_folder) as scanner:
                 entries = sorted(scanner, key=lambda entry: entry.path.lower())
-        except OSError:
+        except OSError as exc:
+            if tracker is not None:
+                tracker.issue(current_folder, exc)
             continue
 
         child_folders: list[Path] = []
@@ -70,7 +73,9 @@ def iter_excel_files(folder_path: str | Path, cancel_event: object | None = None
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
-            except OSError:
+            except OSError as exc:
+                if tracker is not None:
+                    tracker.issue(Path(entry.path), exc)
                 continue
 
             path = Path(entry.path)

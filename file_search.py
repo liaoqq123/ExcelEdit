@@ -9,6 +9,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
+from search_status import SearchTracker
 
 
 DEFAULT_MAX_FILE_SEARCH_RESULTS = 20_000
@@ -39,6 +40,7 @@ def search_files(
     suffixes: str | Iterable[str] | None = None,
     exact_match: bool = False,
     include_folders: bool = False,
+    tracker: SearchTracker | None = None,
 ) -> list[FileSearchResult]:
     """递归检索文件和可选的文件夹，可按一个或多个文件后缀过滤文件。"""
 
@@ -46,10 +48,12 @@ def search_files(
     normalized_keyword = keyword.strip().lower()
     normalized_suffixes = normalize_file_suffixes(suffixes)
     results: list[FileSearchResult] = []
+    tracker = tracker or SearchTracker()
 
-    for result_path, is_directory in _iter_search_paths(folder, cancel_event, include_folders):
+    for result_path, is_directory in _iter_search_paths(folder, cancel_event, include_folders, tracker):
         if _is_cancelled(cancel_event):
             break
+        tracker.scan(result_path)
         file_name = result_path.name
         file_address = str(result_path)
         if not is_directory and normalized_suffixes and not file_name.lower().endswith(normalized_suffixes):
@@ -69,10 +73,14 @@ def search_files(
                 is_directory=is_directory,
             )
         )
+        tracker.result_count = len(results)
         if max_results is not None and len(results) >= max_results:
+            tracker.finish("cancelled" if _is_cancelled(cancel_event) else "limit")
             break
 
     results.sort(key=lambda result: result.file_address.lower())
+    if tracker.stop_reason == "running":
+        tracker.finish("cancelled" if _is_cancelled(cancel_event) else "completed")
     return results
 
 
@@ -100,6 +108,7 @@ def _iter_search_paths(
     folder: Path,
     cancel_event: Event | None,
     include_folders: bool,
+    tracker: SearchTracker | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """用 os.scandir 递归遍历文件，并按需返回子文件夹。"""
 
@@ -123,9 +132,13 @@ def _iter_search_paths(
                             continue
                         if entry.is_file(follow_symlinks=False):
                             yield Path(entry.path), False
-                    except OSError:
+                    except OSError as exc:
+                        if tracker is not None:
+                            tracker.issue(Path(entry.path), exc)
                         continue
-        except OSError:
+        except OSError as exc:
+            if tracker is not None:
+                tracker.issue(current_folder, exc)
             continue
 
 

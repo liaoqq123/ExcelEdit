@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from cache_store import read_cache_data, update_cache_data
 from cell_search import ExcelCellSearchIssue, search_excel_cells
 from excel_common import EXCEL_MAX_ROWS, ExcelReadError
 from file_search import search_files
+from json_validation import validate_excel_json_columns
 from popup_gui import parse_positive_int
 from worksheet_search import scan_excel_workbooks
 
@@ -31,6 +33,133 @@ class InputValidationTests(unittest.TestCase):
 
 
 class CellSearchTests(unittest.TestCase):
+    def test_metadata_formula_entities_and_chinese_do_not_force_full_sheet_parse(self) -> None:
+        xml = (
+            '<worksheet><sheetData><row r="1">'
+            '<c r="A1" t="str"><f>"说明"&amp;"其他"</f><v>haystack</v></c>'
+            '</row></sheetData><hyperlinks><hyperlink location="说明 &amp; Other"/></hyperlinks></worksheet>'
+        ).encode("utf-8")
+        self.assertFalse(cell_search._prefilter_buffer_has_hint(
+            xml.lower(), set(), cell_search._direct_keyword_hints("needle"), "needle", set(),
+        ))
+
+    def test_negative_chinese_shared_string_search_does_not_decode_every_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "chinese.xlsx"
+            workbook = xlsxwriter.Workbook(path)
+            sheet = workbook.add_worksheet("Data")
+            for row in range(1000):
+                sheet.write(row, 0, f"普通配置说明{row}")
+            workbook.close()
+            with zipfile.ZipFile(path) as archive, patch(
+                "cell_search._decode_shared_string_item", wraps=cell_search._decode_shared_string_item,
+            ) as decode:
+                matches = cell_search._read_matching_shared_strings(archive, "不存在的关键词")
+            self.assertEqual(matches, {})
+            self.assertEqual(decode.call_count, 0)
+
+    def test_negative_inline_unicode_and_alphanumeric_search_skip_full_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inline.xlsx"
+            workbook = xlsxwriter.Workbook(path, {"constant_memory": True})
+            sheet = workbook.add_worksheet("Data")
+            sheet.write("A1", "其他中文说明")
+            sheet.write_datetime("A2", datetime(2026, 7, 14), workbook.add_format({"num_format": "yyyy-mm-dd"}))
+            workbook.close()
+            with patch("cell_search._search_sheet_xml_cells", wraps=cell_search._search_sheet_xml_cells) as parse, patch(
+                "cell_search._read_workbook_format_info", wraps=cell_search._read_workbook_format_info,
+            ) as formats:
+                self.assertEqual(search_excel_cells(directory, "角色1001001"), [])
+            self.assertEqual(parse.call_count, 0)
+            self.assertEqual(formats.call_count, 0)
+
+    def test_negative_numeric_query_checks_formatted_values_before_full_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = xlsxwriter.Workbook(Path(directory) / "formatted.xlsx")
+            sheet = workbook.add_worksheet("Data")
+            sheet.write_datetime("A1", datetime(2026, 7, 14), workbook.add_format({"num_format": "yyyy-mm-dd"}))
+            sheet.write_number("A2", 12.34, workbook.add_format({"num_format": "0%"}))
+            workbook.close()
+            with patch("cell_search._search_sheet_xml_cells", wraps=cell_search._search_sheet_xml_cells) as parse:
+                self.assertEqual(search_excel_cells(directory, "999999"), [])
+            self.assertEqual(parse.call_count, 0)
+            hits = search_excel_cells(directory, "1234")
+            self.assertEqual([hit.row_index for hit in hits], [2])
+            self.assertEqual(hits[0].value, "1234%")
+
+    def test_early_excel_dates_and_rounding_still_match_display_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = xlsxwriter.Workbook(Path(directory) / "rounding.xlsx")
+            sheet = workbook.add_worksheet("Data")
+            sheet.write_number("A1", 1, workbook.add_format({"num_format": "yyyy-mm-dd"}))
+            sheet.write_number("A2", 999999.999, workbook.add_format({"num_format": "0.00"}))
+            workbook.close()
+            self.assertEqual([hit.row_index for hit in search_excel_cells(directory, "1900")], [1])
+            self.assertEqual([hit.row_index for hit in search_excel_cells(directory, "1000000")], [2])
+
+    def test_negative_search_with_enabled_data_filters_keeps_fast_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = xlsxwriter.Workbook(Path(directory) / "filtered.xlsx")
+            sheet = workbook.add_worksheet("Data")
+            sheet.write("A1", "字段说明")
+            for row in range(1, 200):
+                sheet.write(row, 0, f"其他中文配置{row}")
+            sheet.write_formula("B2", '="说明"&"文字"', None, "说明文字")
+            workbook.close()
+            config = cell_search.DataFilterConfig(enable_header_filter=True, header_row_count=1)
+            with patch("cell_search._search_sheet_xml_cells", wraps=cell_search._search_sheet_xml_cells) as parse:
+                self.assertEqual(search_excel_cells(directory, "不存在的技能展示", data_filter_config=config), [])
+            self.assertEqual(parse.call_count, 0)
+
+    def test_partial_display_values_are_searchable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = xlsxwriter.Workbook(Path(directory) / "display.xlsx")
+            sheet = workbook.add_worksheet("Data")
+            sheet.write_datetime("A1", datetime(2026, 7, 14), workbook.add_format({"num_format": "yyyy-mm-dd"}))
+            sheet.write_boolean("B1", True)
+            sheet.write_boolean("C1", False)
+            workbook.close()
+            for keyword, column in (("2026", 1), ("tru", 2), ("als", 3)):
+                with self.subTest(keyword=keyword):
+                    hits = search_excel_cells(directory, keyword)
+                    self.assertEqual([hit.column_index for hit in hits], [column])
+                    self.assertEqual(search_excel_cells(directory, keyword, exact_match=True), [])
+
+    def test_entities_and_unicode_case_survive_prefilter(self) -> None:
+        for inline in (False, True):
+            with self.subTest(inline=inline), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "text.xlsx"
+                workbook = xlsxwriter.Workbook(path, {"constant_memory": inline})
+                sheet = workbook.add_worksheet("Data")
+                sheet.write("A1", "铁剑")
+                sheet.write("A2", "Äpfel")
+                workbook.close()
+                with zipfile.ZipFile(path) as archive:
+                    parts = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for name, content in parts.items():
+                        archive.writestr(name, content.replace("铁剑".encode(), b"&#38081;&#21073;"))
+                self.assertEqual([hit.row_index for hit in search_excel_cells(directory, "铁剑")], [1])
+                self.assertEqual([hit.row_index for hit in search_excel_cells(directory, "äpfel")], [2])
+
+    def test_shared_reference_handles_empty_cells_whitespace_and_long_boundaries(self) -> None:
+        xml = b'<c r="A1"/><c r="B1" t=\'s\'><v> 007 </v></c>'
+        self.assertTrue(cell_search._has_typed_shared_string_reference(xml, {b"7"}))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "long.xlsx"
+            workbook = xlsxwriter.Workbook(path)
+            workbook.add_worksheet("Data").write("A1", "needle")
+            workbook.close()
+            with zipfile.ZipFile(path) as archive:
+                parts = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+                for name, content in parts.items():
+                    if name == "xl/worksheets/sheet1.xml":
+                        content = content.replace(b'<v>0</v>', b'<v>' + b' ' * 10000 + b'0</v>')
+                    archive.writestr(name, content)
+            with patch.object(cell_search, "FAST_PREFILTER_MEMORY_LIMIT", 1024), patch.object(cell_search, "PREFILTER_CHUNK_SIZE", 31):
+                self.assertEqual(len(search_excel_cells(directory, "needle")), 1)
+
     def test_prefilter_ignores_unrelated_inline_and_formula_strings(self) -> None:
         xml = (
             b'<worksheet><sheetData><row r="1">'
@@ -188,6 +317,38 @@ class CellSearchTests(unittest.TestCase):
             self.assertEqual([match.row_index for match in matches], [1, 3])
 
 
+class JsonValidationTests(unittest.TestCase):
+    def test_validator_checks_identified_columns_and_skips_dollar_sheets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workbook = xlsxwriter.Workbook(root / "json-data.xlsx")
+            enabled_sheet = workbook.add_worksheet("Enabled")
+            enabled_sheet.write("A4", '{"id": 1}')
+            enabled_sheet.write("A5", '{"id": }')
+            enabled_sheet.write("A6", '["one", "two"]')
+            enabled_sheet.write("A7", '{"id": 2}')
+            enabled_sheet.write("B4", "ordinary text")
+            enabled_sheet.write("B6", "ordinary text")
+            enabled_sheet.write("C4", "{not valid json")
+            enabled_sheet.write("C6", "{still not valid json")
+            disabled_sheet = workbook.add_worksheet("$Disabled")
+            disabled_sheet.write("A4", '{"ignored": }')
+            disabled_sheet.write("A6", '{"ignored": 1}')
+            workbook.close()
+
+            report = validate_excel_json_columns(root)
+
+        self.assertEqual(report.workbook_count, 1)
+        self.assertEqual(report.sheet_count, 1)
+        self.assertEqual(report.json_column_count, 1)
+        self.assertEqual(report.checked_cell_count, 4)
+        self.assertEqual(len(report.errors), 1)
+        error = report.errors[0]
+        self.assertEqual((error.sheet_name, error.row_index, error.column_index), ("Enabled", 5, 1))
+        self.assertEqual(error.value, '{"id": }')
+        self.assertIn("JSON", error.message)
+
+
 class FileSearchTests(unittest.TestCase):
     def test_file_result_limit_is_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -230,6 +391,17 @@ class FileSearchTests(unittest.TestCase):
 
 
 class WorksheetSearchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for patcher in (
+            patch("worksheet_search.read_cache_data", return_value={}),
+            patch("worksheet_search.update_cache_data", return_value=True),
+            patch("worksheet_search._sheet_name_cache", None),
+            patch("worksheet_search._sheet_name_cache_dirty", False),
+            patch("worksheet_search._load_legacy_sheet_name_cache", return_value={}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_exact_worksheet_search_matches_complete_sheet_or_workbook_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

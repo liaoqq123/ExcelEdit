@@ -7,6 +7,7 @@
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from html import escape, unescape
+from functools import lru_cache
 from pathlib import Path
 from threading import Event
 import posixpath
@@ -18,6 +19,7 @@ from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format
 from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, from_excel
 
 from excel_common import EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError, iter_excel_files
+from search_status import SearchTracker, describe_error
 
 
 MAIN_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -27,14 +29,24 @@ WORKBOOK_RELS_PART_PATH = "xl/_rels/workbook.xml.rels"
 SHARED_STRINGS_PART_PATH = "xl/sharedStrings.xml"
 STYLES_PART_PATH = "xl/styles.xml"
 CELL_REFERENCE_PATTERN = re.compile(r"^([A-Za-z]+)(\d+)$")
-SHARED_VALUE_PATTERN = re.compile(rb"<v>\s*(\d+)\s*</v>")
-INLINE_RICH_TEXT_CELL_PATTERN = re.compile(
-    rb"<c\b(?=[^>]*\bt=\"inlinestr\")[^>]*>.*?<is\b[^>]*>.*?<r\b",
+SHARED_VALUE_PATTERN = re.compile(rb"<(?:[\w.-]+:)?v>\s*(\d+)\s*</(?:[\w.-]+:)?v>")
+SHARED_STRING_ITEM_PATTERN = re.compile(
+    rb"<(?:[\w.-]+:)?si\b[^>]*(?<!/)>(.*?)</(?:[\w.-]+:)?si\s*>|<(?:[\w.-]+:)?si\b[^>]*/>", re.DOTALL,
+)
+SHARED_STRING_TEXT_PATTERN = re.compile(rb"<(?:[\w.-]+:)?t(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?t\s*>", re.DOTALL)
+CELL_STYLE_PATTERN = re.compile(rb"<(?:[\w.-]+:)?c\b[^>]*\bs\s*=\s*['\"](\d+)['\"][^>]*>")
+CELL_START_PATTERN = re.compile(rb"<(?:[\w.-]+:)?c\b")
+CELL_END_PATTERN = re.compile(rb"</(?:[\w.-]+:)?c\s*>")
+PREFIXED_CELL_TAG_PATTERN = re.compile(rb"<[\w.-]+:[cv]\b")
+CELL_XML_PATTERN = re.compile(rb"<(?:[\w.-]+:)?c\b([^>]*)(?<!/)>(.*?)</(?:[\w.-]+:)?c\s*>", re.DOTALL)
+SHARED_TYPE_PATTERN = re.compile(rb"\bt\s*=\s*(['\"])s\1")
+TEXT_CELL_PATTERN = re.compile(
+    rb"<(?:[\w.-]+:)?c\b(?=[^>]*\bt\s*=\s*['\"](?:inlinestr|str)['\"])[^>]*(?<!/)>(.*?)</(?:[\w.-]+:)?c\s*>",
     re.DOTALL,
 )
-SHARED_STRING_ITEM_PATTERN = re.compile(rb"<si\b[^>]*>(.*?)</si>", re.DOTALL)
-SHARED_STRING_TEXT_PATTERN = re.compile(rb"<t(?:\s[^>]*)?>(.*?)</t>", re.DOTALL)
-CELL_STYLE_PATTERN = re.compile(rb"<c\b[^>]*\bs=\"(\d+)\"[^>]*>")
+CACHED_TEXT_PATTERN = re.compile(rb"<(?:[\w.-]+:)?v\b[^>]*>(.*?)</(?:[\w.-]+:)?v\s*>", re.DOTALL)
+CELL_TYPE_ATTRIBUTE_PATTERN = re.compile(rb"\bt\s*=\s*['\"]([^'\"]+)['\"]")
+CELL_STYLE_ATTRIBUTE_PATTERN = re.compile(rb"\bs\s*=\s*['\"](\d+)['\"]")
 ROW_TAG = f"{{{MAIN_NAMESPACE}}}row"
 CELL_TAG = f"{{{MAIN_NAMESPACE}}}c"
 TEXT_TAG = f"{{{MAIN_NAMESPACE}}}t"
@@ -121,6 +133,7 @@ def search_excel_cells(
     issues: list[ExcelCellSearchIssue] | None = None,
     max_results: int | None = DEFAULT_MAX_SEARCH_RESULTS,
     exact_match: bool = False,
+    tracker: SearchTracker | None = None,
 ) -> list[ExcelCellMatch]:
     """在目录内所有 Excel 文件中搜索单元格缓存值。"""
 
@@ -129,12 +142,14 @@ def search_excel_cells(
         raise ExcelReadError("Search keyword cannot be empty")
 
     matches: list[ExcelCellMatch] = []
-    for path in iter_excel_files(folder_path, cancel_event=cancel_event):
+    tracker = tracker or SearchTracker()
+    for path in iter_excel_files(folder_path, cancel_event=cancel_event, tracker=tracker):
         if _is_cancelled(cancel_event):
             break
         remaining_results = None if max_results is None else max(max_results - len(matches), 0)
         if remaining_results == 0:
             break
+        tracker.scan(path)
         try:
             file_matches = _search_excel_file_cells(
                 path,
@@ -147,9 +162,17 @@ def search_excel_cells(
             )
         except ExcelReadError as exc:
             if issues is not None:
-                issues.append(ExcelCellSearchIssue(path=path, message=str(exc)))
+                issues.append(ExcelCellSearchIssue(path=path, message=describe_error(exc)))
+            tracker.issue(path, exc)
             continue
         matches.extend(file_matches)
+        tracker.result_count = len(matches)
+        if max_results is not None and len(matches) >= max_results:
+            tracker.finish("cancelled" if _is_cancelled(cancel_event) else "limit")
+            break
+
+    if tracker.stop_reason == "running":
+        tracker.finish("cancelled" if _is_cancelled(cancel_event) else "completed")
 
     return matches
 
@@ -215,7 +238,6 @@ def _search_xlsx_xml_cells(
             if _is_cancelled(cancel_event):
                 return []
 
-            # 启用数据过滤时后面还要读取列/行标记，所以先完整拿到共享字符串表。
             shared_strings = _read_shared_strings(archive, cancel_event) if data_filter_config is not None else None
             matching_shared_strings = (
                 _filter_matching_shared_strings(shared_strings, keyword, cancel_event, exact_match)
@@ -254,6 +276,7 @@ def _search_xlsx_xml_cells(
                     direct_hints,
                     relevant_style_ids,
                     cancel_event,
+                    format_info=format_info,
                 ):
                     continue
                 matches.extend(
@@ -362,7 +385,10 @@ def _get_relevant_formatted_style_ids(format_info: WorkbookFormatInfo, keyword: 
 def _keyword_may_target_formatted_number(keyword: str) -> bool:
     """普通文字无需读取 styles.xml；仅疑似格式化数字搜索才加载样式。"""
 
-    return any(char.isdigit() for char in keyword) and any(
+    # 格式化结果只会由数字和这些分隔符组成；带其他文字的 ID 无需加载样式。
+    if any(not char.isdigit() and char not in "-/:.,%年月日¥￥$€£+ " for char in keyword):
+        return False
+    return any(char.isdigit() for char in keyword) or any(
         marker in keyword for marker in ("-", "/", ":", ".", ",", "%", "年", "月", "日", "¥", "￥", "$", "€", "£")
     )
 
@@ -372,16 +398,22 @@ def _number_format_may_match_keyword(number_format: str, keyword: str) -> bool:
 
     format_section = number_format.split(";", 1)[0]
     if is_date_format(number_format):
+        if keyword.isdigit() and len(keyword) > 4:
+            return False  # 支持的日期显示形式最长连续数字段是四位年份。
         return any(char.isdigit() for char in keyword) or any(
             marker in keyword for marker in ("-", "/", ":", "年", "月", "日")
         )
-    if "%" in format_section and "%" in keyword:
+    if "%" in format_section and ("%" in keyword or any(char.isdigit() for char in keyword)):
         return True
     if any(symbol in format_section and symbol in keyword for symbol in ("¥", "￥", "$", "€", "£")):
         return True
-    if "," in format_section and "," in keyword:
+    if "," in format_section and ("," in keyword or any(char.isdigit() for char in keyword)):
+        decimal_match = re.search(r"\.([0#]+)", format_section)
+        decimal_places = len(decimal_match.group(1)) if decimal_match else 0
+        if keyword.isdigit() and len(keyword) > max(3, decimal_places):
+            return False  # 千分位分隔后的整数段最多三位。
         return True
-    return "." in keyword and re.search(r"\.[0#]+", format_section) is not None
+    return ("." in keyword or any(char.isdigit() for char in keyword)) and re.search(r"\.[0#]+", format_section) is not None
 
 
 def _sheet_xml_has_search_hint(
@@ -392,6 +424,7 @@ def _sheet_xml_has_search_hint(
     direct_hints: set[bytes],
     relevant_style_ids: set[bytes],
     cancel_event: Event | None = None,
+    format_info: WorkbookFormatInfo | None = None,
 ) -> bool:
     """先快速扫描 XML 字节；小文件整块检查，大文件分块检查以限制内存。"""
 
@@ -407,24 +440,39 @@ def _sheet_xml_has_search_hint(
             direct_hints,
             keyword,
             relevant_style_ids,
+            format_info,
         )
 
-    overlap = b""
+    pending = b""
     with archive.open(sheet_xml_path) as stream:
         while not _is_cancelled(cancel_event):
             chunk = stream.read(PREFILTER_CHUNK_SIZE)
             if not chunk:
                 return False
-            normalized_chunk = (overlap + chunk).lower()
+            normalized_chunk = (pending + chunk).lower()
             if _prefilter_buffer_has_hint(
                 normalized_chunk,
                 matching_shared_string_ids,
                 direct_hints,
                 keyword,
                 relevant_style_ids,
+                format_info,
             ):
                 return True
-            overlap = normalized_chunk[-PREFILTER_OVERLAP_SIZE:]
+            # 保留完整的未结束单元格，不能用固定重叠长度截断长文本或编号。
+            # 常规 XML 用 C 层 rfind 定位尾部，不逐个创建数十万个 Python Match 对象。
+            last_start = normalized_chunk.rfind(b"<c")
+            while last_start >= 0 and CELL_START_PATTERN.match(normalized_chunk, last_start) is None:
+                last_start = normalized_chunk.rfind(b"<c", 0, last_start)
+            if b":c" in normalized_chunk and re.search(rb"<[\w.-]+:c\b", normalized_chunk):
+                for start in CELL_START_PATTERN.finditer(normalized_chunk):
+                    last_start = start.start()
+            if last_start >= 0 and CELL_END_PATTERN.search(normalized_chunk, last_start) is None:
+                pending = normalized_chunk[last_start:]
+                if len(pending) > FAST_PREFILTER_MEMORY_LIMIT:
+                    return True  # 异常大的单元格交给流式 XML 解析。
+            else:
+                pending = normalized_chunk[-max(PREFILTER_OVERLAP_SIZE, 64):]
     return False
 
 
@@ -434,27 +482,93 @@ def _prefilter_buffer_has_hint(
     direct_hints: set[bytes],
     keyword: str,
     relevant_style_ids: set[bytes],
+    format_info: WorkbookFormatInfo | None = None,
 ) -> bool:
     """检查一段小写 XML 字节中是否存在需要进一步解析的迹象。"""
 
+    if any(hint and hint in normalized_xml for hint in direct_hints):
+        return True
     if matching_shared_string_ids and _has_typed_shared_string_reference(
         normalized_xml,
         matching_shared_string_ids,
     ):
         return True
-    if any(hint and hint in normalized_xml for hint in direct_hints):
-        return True
-    # 普通 inlineStr 和公式缓存字符串已经由直接字节命中覆盖；只对可能跨多个
-    # <r><t>...</t></r> 片段的富文本保留完整解析兜底。
-    if b"<r>" in normalized_xml and b't="inlinestr"' in normalized_xml:
-        if INLINE_RICH_TEXT_CELL_PATTERN.search(normalized_xml) is not None:
-            return True
-    if keyword in {"true", "false"} and b't="b"' in normalized_xml:
+    # 只解码实际的文本单元格；公式、批注、链接中的 & 或中文不触发整表解析。
+    has_text_cells = b"inlinestr" in normalized_xml or b'"str"' in normalized_xml or b"'str'" in normalized_xml
+    if has_text_cells and _shared_string_may_match(
+        _normalize_xml_text(normalized_xml, keyword), direct_hints, keyword,
+        allow_rich_text=b"inlinestr" in normalized_xml,
+    ):
+        for cell in TEXT_CELL_PATTERN.finditer(normalized_xml):
+            body = cell.group(1)
+            if SHARED_STRING_TEXT_PATTERN.search(body) is not None:
+                text = _decode_shared_string_item(body)
+            else:
+                cached = CACHED_TEXT_PATTERN.search(body)
+                text = unescape(cached.group(1).decode("utf-8", errors="replace")) if cached is not None else ""
+            if _get_matched_text(text, keyword) is not None:
+                return True
+    if any(keyword in value for value in ("true", "false")) and re.search(rb"\bt\s*=\s*['\"]b['\"]", normalized_xml):
         return True
     if relevant_style_ids:
+        if format_info is not None:
+            return _has_formatted_value_match(normalized_xml, relevant_style_ids, keyword, format_info)
         for match in CELL_STYLE_PATTERN.finditer(normalized_xml):
             if match.group(1) in relevant_style_ids:
                 return True
+    return False
+
+
+@lru_cache(maxsize=128)
+def _formatted_cell_pattern(style_ids: tuple[bytes, ...]) -> re.Pattern[bytes]:
+    alternatives = b"|".join(re.escape(style_id) for style_id in style_ids)
+    return re.compile(
+        rb"<(?:[\w.-]+:)?c\b(?=[^>]*\bs\s*=\s*['\"](?:" + alternatives +
+        rb")[\"'])([^>]*)(?<!/)>(.*?)</(?:[\w.-]+:)?c\s*>", re.DOTALL,
+    )
+
+
+def _has_formatted_value_match(
+    xml: bytes, style_ids: set[bytes], keyword: str, format_info: WorkbookFormatInfo,
+) -> bool:
+    """先检查候选格式的实际显示值，不能仅因表内有日期或百分比就整表解析。"""
+
+    numeric_bounds = {}
+    if keyword.isdigit() and len(keyword) > 3:
+        for style_id in style_ids:
+            number_format = format_info.number_formats[int(style_id)]
+            if is_date_format(number_format):
+                continue
+            section = number_format.split(";", 1)[0]
+            decimals = re.search(r"\.([0#]+)", section)
+            decimal_places = len(decimals.group(1)) if decimals else 0
+            if len(keyword) > decimal_places:
+                numeric_bounds[int(style_id)] = (
+                    float("inf") if len(keyword) > 309
+                    else ((10 ** (len(keyword) - 1)) - 1) / (100 if "%" in section else 1)
+                )
+    for cell in _formatted_cell_pattern(tuple(sorted(style_ids))).finditer(xml):
+        attrs, body = cell.groups()
+        cell_type = CELL_TYPE_ATTRIBUTE_PATTERN.search(attrs)
+        if cell_type is not None and cell_type.group(1) != b"n":
+            continue
+        style = CELL_STYLE_ATTRIBUTE_PATTERN.search(attrs)
+        value = CACHED_TEXT_PATTERN.search(body)
+        if style is None or value is None:
+            continue
+        style_index = int(style.group(1))
+        if style_index >= len(format_info.number_formats):
+            continue
+        raw = unescape(value.group(1).decode("utf-8", errors="replace"))
+        if style_index in numeric_bounds:
+            try:
+                if abs(float(raw)) < numeric_bounds[style_index]:
+                    continue
+            except ValueError:
+                continue
+        values = _format_numeric_search_values(raw, format_info.number_formats[style_index], format_info.epoch)
+        if _get_first_matched_text(values, keyword) is not None:
+            return True
     return False
 
 
@@ -462,22 +576,38 @@ def _has_typed_shared_string_reference(
     normalized_xml: bytes,
     matching_shared_string_ids: set[bytes],
 ) -> bool:
-    """先线性定位候选编号，仅在编号命中时确认它属于 t="s" 单元格。"""
+    """顺序扫描共享字符串单元格，通过集合查询候选编号。"""
 
-    for shared_string_id in matching_shared_string_ids:
-        value_tag = b"<v>" + shared_string_id + b"</v>"
-        search_start = 0
-        while True:
-            value_start = normalized_xml.find(value_tag, search_start)
-            if value_start < 0:
-                break
-            cell_start = normalized_xml.rfind(b"<c", max(0, value_start - 1024), value_start)
-            if cell_start >= 0:
-                cell_tag_end = normalized_xml.find(b">", cell_start, value_start)
-                if cell_tag_end >= 0 and b't="s"' in normalized_xml[cell_start : cell_tag_end + 1]:
+    if not matching_shared_string_ids:
+        return False
+    has_prefixed_tags = (b":c" in normalized_xml or b":v" in normalized_xml) and PREFIXED_CELL_TAG_PATTERN.search(normalized_xml)
+    if len(matching_shared_string_ids) <= 16 and not has_prefixed_tags:
+        # 少量候选时让正则引擎在 C 层一次筛编号，避免遍历几十万个 Python 单元格对象。
+        pattern = _candidate_shared_value_pattern(tuple(sorted(matching_shared_string_ids)))
+        for value in pattern.finditer(normalized_xml):
+            cell_start = normalized_xml.rfind(b"<c", 0, value.start())
+            while cell_start >= 0 and CELL_START_PATTERN.match(normalized_xml, cell_start) is None:
+                cell_start = normalized_xml.rfind(b"<c", 0, cell_start)
+            if cell_start < 0:
+                continue
+            tag_end = normalized_xml.find(b">", cell_start, value.start())
+            if tag_end >= 0 and SHARED_TYPE_PATTERN.search(normalized_xml, cell_start, tag_end):
+                if CELL_END_PATTERN.search(normalized_xml, tag_end, value.start()) is None:
                     return True
-            search_start = value_start + len(value_tag)
+        return False
+    for cell in CELL_XML_PATTERN.finditer(normalized_xml):
+        if SHARED_TYPE_PATTERN.search(cell.group(1)) is None:
+            continue
+        value = SHARED_VALUE_PATTERN.search(cell.group(2))
+        if value is not None and (value.group(1).lstrip(b"0") or b"0") in matching_shared_string_ids:
+            return True
     return False
+
+
+@lru_cache(maxsize=128)
+def _candidate_shared_value_pattern(identifiers: tuple[bytes, ...]) -> re.Pattern[bytes]:
+    alternatives = b"|".join(re.escape(identifier) for identifier in identifiers)
+    return re.compile(rb"<v>\s*0*(?:" + alternatives + rb")\s*</v>")
 
 
 def _direct_keyword_hints(keyword: str) -> set[bytes]:
@@ -501,7 +631,7 @@ def _read_shared_strings(archive: zipfile.ZipFile, cancel_event: Event | None = 
     for item_match in SHARED_STRING_ITEM_PATTERN.finditer(shared_strings_xml):
         if _is_cancelled(cancel_event):
             break
-        shared_strings.append(_decode_shared_string_item(item_match.group(1)))
+        shared_strings.append(_decode_shared_string_item(item_match.group(1) or b""))
     return shared_strings
 
 
@@ -538,23 +668,47 @@ def _read_matching_shared_strings(
     if _is_cancelled(cancel_event):
         return {}
 
-    normalized_xml = shared_strings_xml.lower()
+    normalized_xml = _normalize_xml_text(shared_strings_xml, keyword)
     direct_hints = _direct_keyword_hints(keyword)
-    if not any(hint and hint in normalized_xml for hint in direct_hints) and b"<r>" not in normalized_xml:
+    if not _shared_string_may_match(normalized_xml, direct_hints, keyword):
         return {}
 
     matching_shared_strings: dict[int, str] = {}
     for shared_string_index, item_match in enumerate(SHARED_STRING_ITEM_PATTERN.finditer(shared_strings_xml)):
         if _is_cancelled(cancel_event):
             break
-        item_xml = item_match.group(1)
-        normalized_item_xml = item_xml.lower()
-        if not any(hint and hint in normalized_item_xml for hint in direct_hints) and b"<r>" not in normalized_item_xml:
+        item_xml = item_match.group(1) or b""
+        normalized_item_xml = _normalize_xml_text(item_xml, keyword)
+        if not _shared_string_may_match(normalized_item_xml, direct_hints, keyword):
             continue
         text = _decode_shared_string_item(item_xml)
         if _get_matched_text(text, keyword, exact_match) is not None:
             matching_shared_strings[shared_string_index] = text
     return matching_shared_strings
+
+
+def _normalize_xml_text(xml: bytes, keyword: str) -> bytes:
+    """Unicode 大小写在字节层预筛一次处理，避免逐条解码未命中的中文。"""
+
+    if keyword.upper() != keyword and not xml.isascii():
+        return xml.decode("utf-8", errors="replace").lower().encode("utf-8")
+    return xml.lower()
+
+
+def _shared_string_may_match(xml: bytes, hints: set[bytes], keyword: str, allow_rich_text: bool = True) -> bool:
+    """只有可能影响当前关键词的转义或富文本才需要进一步解码。"""
+
+    return (
+        any(hint and hint in xml for hint in hints)
+        or b"&#" in xml
+        or any(char in keyword and entity in xml for char, entity in (
+            ("&", b"&amp;"), ("<", b"&lt;"), (">", b"&gt;"), ('"', b"&quot;"), ("'", b"&apos;"),
+        ))
+        or (allow_rich_text and keyword[:1].encode("utf-8") in xml and (
+            any(marker in xml for marker in (b"<r>", b"<r ", b"<r\n", b"<r\r", b"<r\t"))
+            or (b":r" in xml and re.search(rb"<[\w.-]+:r\b", xml) is not None)
+        ))
+    )
 
 
 def _decode_shared_string_item(item_xml: bytes) -> str:
