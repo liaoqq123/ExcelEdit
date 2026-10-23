@@ -10,11 +10,10 @@ from tkinter import TclError
 from unittest.mock import patch
 
 from cell_search import ExcelCellMatch
-from cache_store import read_cache_data, update_cache_data
 from file_search import FileSearchResult
-from gui import ExcelEditApp, format_excel_cell_address, load_cache_data as load_gui_cache_data, save_cache_data as save_gui_cache_data
+from gui import ExcelEditApp, format_excel_cell_address
 from json_validation import JsonValidationError, JsonValidationReport
-from worksheet_search import DEFAULT_REFERENCE_LOOKUP_CONFIG, WORKSHEET_SHEET_CACHE_KEY, ExcelSheetReference, ExcelWorkbookInfo
+from worksheet_search import DEFAULT_REFERENCE_LOOKUP_CONFIG, ExcelSheetReference, ExcelWorkbookInfo
 from search_status import SearchTracker
 from PIL import Image
 
@@ -488,30 +487,6 @@ class GuiRegressionTests(unittest.TestCase):
             with patch.object(self.app.search_settings_dialog, "refresh") as refresh:
                 self.app._on_search_mode_changed("文件检索")
             refresh.assert_called_once_with("文件检索")
-
-
-class CachePreferenceTests(unittest.TestCase):
-    def test_view_preference_round_trip_preserves_shared_sheet_index_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            cache_file = Path(directory) / "cache.json"
-            index_cache = {"existing.xlsx": {"sheets": ["技能"]}}
-            update_cache_data({WORKSHEET_SHEET_CACHE_KEY: index_cache}, cache_file, None)
-            preferences = {
-                "pinned_folders": [r"D:\data\one", r"D:\data\one", r"D:\data\two"],
-                "preview_enabled": False,
-                "result_density": "紧凑",
-                "file_result_view": "表格",
-            }
-            with patch("gui.update_shared_cache_data", side_effect=lambda updates: update_cache_data(updates, cache_file, None)):
-                self.assertTrue(save_gui_cache_data(preferences))
-            with patch("gui.read_cache_file", side_effect=lambda: read_cache_data(cache_file, None)):
-                loaded = load_gui_cache_data()
-
-            self.assertEqual(loaded["pinned_folders"], [r"D:\data\one", r"D:\data\two"])
-            self.assertFalse(loaded["preview_enabled"])
-            self.assertEqual(loaded["result_density"], "紧凑")
-            self.assertEqual(loaded["file_result_view"], "表格")
-            self.assertEqual(read_cache_data(cache_file, None)[WORKSHEET_SHEET_CACHE_KEY], index_cache)
 
 
 if __name__ == "__main__":

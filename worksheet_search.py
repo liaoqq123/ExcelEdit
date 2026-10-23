@@ -296,22 +296,6 @@ def _flush_sheet_name_cache() -> None:
             _sheet_name_cache_dirty = True
 
 
-def find_sheet_references(
-    file_path: str | Path,
-    sheet_name: str,
-    row_index: int = 6,
-) -> list[str]:
-    """查找指定行内引用到的工作表名称，保留给简化调用场景使用。"""
-
-    config = ReferenceLookupConfig(reference_row_index=row_index)
-    matches = find_sheet_reference_matches(file_path, sheet_name, config)
-    references: list[str] = []
-    for match in matches:
-        if match.sheet_name and match.sheet_name not in references:
-            references.append(match.sheet_name)
-    return references
-
-
 def find_sheet_reference_matches(
     file_path: str | Path,
     sheet_name: str,

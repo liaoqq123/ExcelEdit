@@ -49,6 +49,8 @@
 | 文件检索 | 文件名、文件地址，以及可选的文件夹名称 | 可切换缩略图和表格视图；结果按所在文件夹分组，不分页。 |
 | JSON 格式检查 | 非 `$` 工作表中由第 4、6 行识别出的 JSON 数据列 | 表格显示每处格式错误的位置、原文和原因；双击可打开并定位到错误单元格。 |
 
+工作表检索和单元格检索固定只处理 `.xlsx`、`.xlsm`、`.xltx`、`.xltm`、`.xls`、`.xlsb`，界面显示“仅 Excel 文件”。遍历时先按文件名过滤，其他文件不进行文件类型检查或内容读取；子目录继续递归查找 Excel，`~$` 临时锁文件自动跳过。
+
 ### 工作表检索
 
 - 每个匹配的工作表独立成行，显示所属工作簿、启用状态和操作入口。
@@ -169,18 +171,17 @@ python -m venv .venv
 
 ### 不创建窗口的检查
 
-在项目根目录执行以下命令，不会启动程序窗口：
+在项目根目录安装开发依赖，再使用统一的无窗口检查入口：
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_core.py -v
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_preview_image_lifecycle.py -v
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_gui_performance.py -v
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_desktop_open.py -v
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_excel_navigation.py -v
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe scripts\check_headless.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_performance.py
 ```
 
-测试和性能脚本使用隔离配置或临时文件，不读写用户检索历史和设置。图片生命周期和刷新调度测试通过假对象验证切换、清空、关闭及重复刷新，不创建 Tk 或窗口。打开操作测试模拟系统调用；定位脚本测试在隐藏 PowerShell 中使用假工作簿，不调用真实 Excel 或 COM。性能脚本默认检查共享字符串预筛、50,000 单元格工作簿检索，以及中文、公式和数据过滤场景下的未命中预筛。
+`check_headless.py` 只加载明确列出的无窗口测试，并阻止意外创建 Tk 窗口、调用原生窗口接口或打开外部程序。添加 `-v` 查看每项检查，添加 `--list` 查看检查范围。
+
+测试和性能脚本使用隔离配置或临时文件，不读写用户检索历史和设置。图片生命周期和刷新调度测试通过假对象验证切换、清空、关闭及重复刷新。打开操作测试模拟系统调用；定位脚本测试在隐藏 PowerShell 中使用假工作簿，不调用真实 Excel 或 COM。性能脚本默认检查共享字符串预筛、50,000 单元格工作簿检索，以及中文、公式和数据过滤场景下的未命中预筛。`xlsxwriter` 仅用于生成测试和性能样本，归入开发依赖；程序导出使用 `openpyxl`。
 
 ### 完整界面检查
 
@@ -201,12 +202,31 @@ python -m venv .venv
 
 输出文件为 `dist\奶龙检索大师.exe`。更新源码或 EXE 后需退出旧进程再启动；在 PyCharm 中运行源码时，先停止当前运行，再重新执行 `main.py`。
 
+## 代码结构
+
+| 模块 | 职责 |
+| --- | --- |
+| `main.py`、`gui.py`、`main_layout.py`、`popup_gui.py` | 启动、界面交互、主布局和设置窗口。 |
+| `app_preferences.py`、`input_validation.py` | 配置默认值、旧字段兼容、历史目录整理和输入校验，不依赖界面控件。 |
+| `cache_store.py` | 配置文件路径、旧缓存迁移和原子读写。 |
+| `excel_common.py`、`cell_search.py`、`worksheet_search.py` | Excel 文件枚举、读取和检索。 |
+| `file_search.py`、`json_validation.py` | 普通文件检索和 Excel JSON 数据检查。 |
+| `desktop_open.py`、`windows_shell.py`、`window_activation.py` | 打开与定位、系统外壳调用和只读窗口状态查询。 |
+| `result_preview.py`、`file_result_view.py`、`result_export.py` | 结果预览、文件视图和 XLSX 导出。 |
+| `scripts/check_headless.py`、`tests/`、`benchmarks/` | 无窗口检查、回归测试和性能对比。 |
+
+后续较大的结构调整可以优先将单元格检索与 JSON 检查共用的 OpenXML 读取逻辑整理为独立模块，减少跨模块引用私有函数；这类调整应结合显示值匹配和快速预筛的现有检查逐步完成。
+
 ## 最近修复
 
+- 拆分界面中的配置处理与输入校验，保留旧配置兼容；清理未使用的接口、重复包装和主动激活窗口代码。
+- 统一无窗口检查入口，将测试专用依赖与运行依赖分开。
+- JSON 检查结果支持按 Excel 单元格地址进行结果内筛选。
 - 修复快速预筛对中文和 XML 转义判断过宽时触发大量完整解析的问题，保留显示值匹配能力。
 - 修复图片预览切换、清空和关闭时的图片引用释放顺序，避免出现 `image "pyimage3" doesn't exist` 一类错误。
 - 关闭窗口时先取消任务和定时回调，再销毁控件；不再为清空预览而重新刷新界面。
 - 避免子控件变化重复触发整个窗口的背景刷新，并跳过尺寸未变化时的背景和遮罩重绘。
+- 整目录 Excel 检索先按文件名和后缀排除非 Excel 与临时锁文件，再检查文件状态，减少大型工程目录中的重复磁盘查询；搜索范围和过滤规则保持一致。
 - 修复子文件夹“打开所在目录”直接进入文件夹的问题，改为 Windows 原生项目定位；路径中的中文、空格、逗号按原样传递。
 - Excel 文件先通过系统正常打开，与在资源管理器中双击文件一致；普通打开不依赖自动化助手。工作表和单元格定位在打开之后执行，连接失败或超时会明确提示，不阻断文件打开，也不重复打开文件。
 - 自动定位仅连接已经打开且可见的目标工作簿，不创建 Excel 自动化实例、不更改整个应用的可见性，避免带出空窗口或其他隐藏窗口。

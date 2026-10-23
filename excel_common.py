@@ -1,18 +1,15 @@
 """Excel 文件读取和写入的通用工具。
 
 这里放跨功能复用的逻辑，例如判断 Excel 文件类型、递归枚举 Excel 文件、
-读取工作表名称、预览数据和导出结果。
+读取工作表名称。
 """
 
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterable, Sequence
 import zipfile
 import xml.etree.ElementTree as ET
 
-from openpyxl import load_workbook
-from xlsxwriter import Workbook
 from search_status import SearchTracker
 
 
@@ -71,6 +68,8 @@ def iter_excel_files(folder_path: str | Path, cancel_event: object | None = None
                 if entry.is_dir(follow_symlinks=False):
                     child_folders.append(Path(entry.path))
                     continue
+                if not is_excel_file_name(entry.name):
+                    continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
             except OSError as exc:
@@ -78,9 +77,7 @@ def iter_excel_files(folder_path: str | Path, cancel_event: object | None = None
                     tracker.issue(Path(entry.path), exc)
                 continue
 
-            path = Path(entry.path)
-            if is_excel_file(path):
-                yield path
+            yield Path(entry.path)
 
         stack.extend(reversed(child_folders))
 
@@ -96,14 +93,19 @@ def validate_excel_folder(folder_path: str | Path) -> Path:
     return folder
 
 
+def is_excel_file_name(name: str) -> bool:
+    """工作表和单元格搜索共享固定的 Excel 白名单，不读取文件状态。"""
+    return not name.startswith("~$") and os.path.splitext(name)[1].lower() in EXCEL_EXTENSIONS
+
+
 def is_excel_file(path: Path) -> bool:
     """判断路径是否是可处理的 Excel 文件，跳过 Excel 临时锁文件。"""
 
-    if not path.is_file():
+    # Reject unrelated assets before querying the filesystem. Large project
+    # roots can contain hundreds of thousands of files and only a few Excel books.
+    if not is_excel_file_name(path.name):
         return False
-    if path.name.startswith("~$"):
-        return False
-    return path.suffix.lower() in EXCEL_EXTENSIONS
+    return path.is_file()
 
 
 def _is_cancelled(cancel_event: object | None) -> bool:
@@ -119,52 +121,6 @@ def clean_cell_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
-
-
-def read_excel_preview(
-    file_path: str | Path,
-    sheet_name: str | None = None,
-    max_rows: int = 20,
-) -> list[list[object]]:
-    """读取指定工作表前几行数据，用于需要快速预览的场景。"""
-
-    path = Path(file_path)
-    if not path.exists():
-        raise ExcelReadError(f"File does not exist: {path}")
-
-    try:
-        workbook = load_workbook(path, read_only=True, data_only=True)
-    except Exception as exc:
-        raise ExcelReadError(f"Could not open Excel file: {path}") from exc
-
-    try:
-        worksheet = workbook[sheet_name] if sheet_name else workbook.active
-        rows: list[list[object]] = []
-        for row in worksheet.iter_rows(max_row=max_rows, values_only=True):
-            rows.append(list(row))
-        return rows
-    finally:
-        workbook.close()
-
-
-def write_rows_to_excel(
-    file_path: str | Path,
-    rows: Iterable[Sequence[object]],
-    sheet_name: str = "Sheet1",
-) -> None:
-    """把二维行数据写入新的 Excel 文件。"""
-
-    path = Path(file_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    workbook = Workbook(str(path))
-    worksheet = workbook.add_worksheet(sheet_name[:31] or "Sheet1")
-
-    for row_index, row in enumerate(rows):
-        for column_index, value in enumerate(row):
-            worksheet.write(row_index, column_index, value)
-
-    workbook.close()
 
 
 def _get_xlsx_xml_sheet_names(path: Path) -> list[str]:
@@ -196,20 +152,6 @@ def _xml_local_name(tag: str) -> str:
     if "}" not in tag:
         return tag
     return tag.rsplit("}", 1)[1]
-
-
-def _get_openpyxl_sheet_names(path: Path) -> list[str]:
-    """使用 openpyxl 读取工作表名称的备用实现。"""
-
-    try:
-        workbook = load_workbook(path, read_only=True, data_only=True)
-    except Exception as exc:
-        raise ExcelReadError(f"Could not open Excel file: {path}") from exc
-
-    try:
-        return list(workbook.sheetnames)
-    finally:
-        workbook.close()
 
 
 def _get_xlrd_sheet_names(path: Path) -> list[str]:

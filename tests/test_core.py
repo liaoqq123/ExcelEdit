@@ -14,11 +14,30 @@ import xlsxwriter
 import cell_search
 from cache_store import read_cache_data, update_cache_data
 from cell_search import ExcelCellSearchIssue, search_excel_cells
-from excel_common import EXCEL_MAX_ROWS, ExcelReadError
+from excel_common import EXCEL_MAX_ROWS, ExcelReadError, is_excel_file
 from file_search import search_files
 from json_validation import validate_excel_json_columns
-from popup_gui import parse_positive_int
+from input_validation import parse_positive_int
 from worksheet_search import scan_excel_workbooks
+
+
+class ExcelFileEligibilityTests(unittest.TestCase):
+    def test_non_excel_and_lock_files_do_not_query_file_status(self) -> None:
+        with patch.object(Path, "is_file", side_effect=AssertionError("Unrelated files must not query disk status")):
+            for name in ("icon.png", "scene.prefab", "code.py", "README", "~$book.xlsx", "~$book.XLSM"):
+                with self.subTest(name=name):
+                    self.assertFalse(is_excel_file(Path(name)))
+
+    def test_excel_candidates_still_require_an_existing_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook = root / "book.XLSX"
+            workbook.write_bytes(b"fixture")
+            named_folder = root / "folder.xlsx"
+            named_folder.mkdir()
+            self.assertTrue(is_excel_file(workbook))
+            self.assertFalse(is_excel_file(named_folder))
+            self.assertFalse(is_excel_file(root / "missing.xls"))
 
 
 class InputValidationTests(unittest.TestCase):

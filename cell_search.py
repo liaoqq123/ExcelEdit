@@ -54,10 +54,6 @@ DEFAULT_MAX_SEARCH_RESULTS = 20_000
 FAST_PREFILTER_MEMORY_LIMIT = 8 * 1024 * 1024
 PREFILTER_CHUNK_SIZE = 1024 * 1024
 PREFILTER_OVERLAP_SIZE = 4096
-ROW_FILTER_MODE_NONE = "无"
-ROW_FILTER_MODE_DISABLED = "禁用"
-ROW_FILTER_MODE_RANGE = "区间"
-ROW_FILTER_MODES = (ROW_FILTER_MODE_NONE, ROW_FILTER_MODE_DISABLED, ROW_FILTER_MODE_RANGE)
 
 
 @dataclass(frozen=True)
@@ -1235,12 +1231,6 @@ def _clean_filter_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
-
-
-def normalize_row_filter_mode(row_filter_mode: str) -> str:
-    """兼容旧缓存中的行过滤模式值。"""
-
-    return row_filter_mode if row_filter_mode in ROW_FILTER_MODES else ROW_FILTER_MODE_NONE
 
 
 def validate_data_filter_config(config: DataFilterConfig) -> None:

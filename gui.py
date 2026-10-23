@@ -15,27 +15,29 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
-from tkinter import Frame as TkFrame, Canvas, Menu, filedialog, font as tkfont, messagebox, ttk
+from tkinter import Frame as TkFrame, Menu, filedialog, font as tkfont, messagebox, ttk
 
 import customtkinter as ctk
 import ui_theme as ui
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
-from cache_store import get_user_cache_directory
-from cache_store import read_cache_data as read_shared_cache_data
-from cache_store import update_cache_data as update_shared_cache_data
+from app_preferences import (
+    DEFAULT_DISABLED_SHEET_MARKER,
+    load_cache_data,
+    normalize_folder_history,
+    normalize_help_url,
+    save_cache_data,
+)
+from cache_store import get_app_directory, get_user_cache_directory
 from cell_search import (
     DEFAULT_DATA_FILTER_CONFIG,
     DataFilterConfig,
     ExcelCellMatch,
     ExcelCellSearchIssue,
     search_excel_cells,
-    validate_data_filter_config,
 )
-from excel_common import EXCEL_EXTENSIONS, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError
+from excel_common import EXCEL_EXTENSIONS, ExcelReadError
 from desktop_open import OpenResult, open_target as open_desktop_target
-from file_result_view import FileResultView
-from result_preview import ResultPreviewPane
 from search_status import SearchSnapshot, SearchTracker
 from file_search import (
     FileSearchError,
@@ -48,25 +50,15 @@ from json_validation import (
     JsonValidationReport,
     validate_excel_json_columns,
 )
-from popup_gui import SearchSettingsDialog, SettingsDialog, parse_positive_int
+from popup_gui import SearchSettingsDialog, SettingsDialog
 from worksheet_search import (
     DEFAULT_REFERENCE_LOOKUP_CONFIG,
     ExcelSheetReference,
     ExcelWorkbookInfo,
     ReferenceLookupConfig,
-    WORKSHEET_SHEET_CACHE_KEY,
     find_sheet_reference_matches,
     scan_excel_workbooks,
-    validate_reference_lookup_config,
 )
-
-
-def get_app_directory() -> Path:
-    """获取应用运行目录，兼容源码运行和 PyInstaller 打包后的 EXE。"""
-
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -80,9 +72,6 @@ def get_resource_path(relative_path: str) -> Path:
 
 APP_NAME = "奶龙检索大师"
 APP_ICON_RELATIVE_PATH = "assets/nailong_search_master.ico"
-DEFAULT_DISABLED_SHEET_MARKER = "$"
-FOLDER_HISTORY_LIMIT = 20
-EXCEL_OPEN_TIMEOUT_SECONDS = 20
 WORKSHEET_RESULT_COLUMNS = (
     ("workbook", "工作簿", 360, 220, True),
     ("sheet", "工作表", 360, 220, True),
@@ -103,7 +92,6 @@ JSON_RESULT_COLUMNS = (
     ("value", "JSON 内容", 360, 200, True),
     ("message", "错误原因", 320, 180, True),
 )
-FILE_THUMBNAIL_COLUMNS = 4
 IMAGE_FILE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 BACKGROUND_IMAGE_FILE_NAME = "software_background.png"
 BACKGROUND_RENDER_MAX_SIZE = (2560, 1440)
@@ -160,8 +148,7 @@ class ExcelEditApp(ctk.CTk):
         self.search_tracker: SearchTracker | None = None
         self.current_result_columns: tuple[str, ...] = ()
         self.file_thumbnail_results: list[FileSearchResult] = []
-        self.file_thumbnail_cards: list[ctk.CTkFrame] = []
-        self.file_thumbnail_images: list[ctk.CTkImage] = []
+        self.file_thumbnail_cards: list[FileSearchResult] = []
         self.background_image_path = ""
         self.background_source_image: Image.Image | None = None
         self.background_fitted_image: Image.Image | None = None
@@ -758,6 +745,9 @@ class ExcelEditApp(ctk.CTk):
 
         mode = self.search_mode_var.get()
         self.mode_display_var.set(next((label for label, value in MODES.items() if value == mode), "工作表"))
+        if mode in {"工作表检索", "单元格检索"}:
+            ctk.CTkLabel(self.filter_chips_frame, text="仅 Excel 文件", height=27, corner_radius=5,
+                fg_color=ui.INSET_BG, text_color=ui.MUTED, font=("Microsoft YaHei UI", 11)).pack(side="left", padx=(0, 8))
         if mode != "JSON格式检查":
             chip("精确匹配 ▾" if self.exact_match_var.get() else "包含匹配 ▾", lambda: self._change_filter(self.exact_match_var))
         if mode in {"工作表检索", "单元格检索"} and self.only_enabled_sheets_var.get():
@@ -996,7 +986,7 @@ class ExcelEditApp(ctk.CTk):
         elif kind == "files":
             data = [r for r in data if not query or query in str(r.path).casefold()]
         elif kind == "json":
-            data = replace(data, errors=[e for e in data.errors if (not query or query in f"{e.path} {e.sheet_name} {e.value} {e.message}".casefold())
+            data = replace(data, errors=[e for e in data.errors if (not query or query in f"{e.path} {e.sheet_name} {format_excel_cell_address(e.row_index, e.column_index)} {e.value} {e.message}".casefold())
                                         and (scope is None or (e.path, e.sheet_name) == scope)])
         return kind, data
 
@@ -1960,7 +1950,7 @@ class ExcelEditApp(ctk.CTk):
 
         self._cancel_tree_render()
         self.result_group_controls.grid_remove()
-        self._clear_file_thumbnail_cards()
+        self.file_thumbnail_frame.clear()
         self.item_targets.clear()
         self.item_raw_values.clear()
         self.selected_target = None
@@ -2023,12 +2013,6 @@ class ExcelEditApp(ctk.CTk):
         for result in self.file_thumbnail_results:
             grouped_results.setdefault(result.path.parent, []).append(result)
         return grouped_results
-
-    def _clear_file_thumbnail_cards(self) -> None:
-        """清空虚拟视图并作废后台图片任务。"""
-
-        self.file_thumbnail_frame.clear()
-        self.file_thumbnail_images.clear()
 
     @staticmethod
     def _get_file_thumbnail_style(result: FileSearchResult) -> tuple[str, str, str]:
@@ -2192,7 +2176,7 @@ class ExcelEditApp(ctk.CTk):
         self.result_group_controls.grid_remove()
         self._hide_result_grid_lines()
         self.file_thumbnail_results.clear()
-        self._clear_file_thumbnail_cards()
+        self.file_thumbnail_frame.clear()
         self.result_generation += 1
         for cancel_event in self.reference_cancel_events.values():
             cancel_event.set()
@@ -2665,250 +2649,6 @@ class ExcelEditApp(ctk.CTk):
                 self.destroy()
 
 
-def load_cache_data() -> dict[str, object]:
-    """读取并规范化缓存数据，避免坏缓存影响启动。"""
-
-    raw_data = read_cache_file()
-    if not raw_data:
-        return {}
-
-    folder_path = raw_data.get("folder_path", "")
-    keyword = raw_data.get("keyword", "")
-    disabled_sheet_marker = raw_data.get("disabled_sheet_marker", DEFAULT_DISABLED_SHEET_MARKER)
-    help_url = raw_data.get("help_url", "")
-    background_image_path = raw_data.get("background_image_path", "")
-    file_suffixes = raw_data.get("file_suffixes", "")
-    return {
-        "pinned_folders": normalize_folder_history(raw_data.get("pinned_folders"))[:10],
-        "preview_enabled": raw_data.get("preview_enabled", True) is not False,
-        "result_density": "紧凑" if raw_data.get("result_density") == "紧凑" else "舒适",
-        "file_result_view": "表格" if raw_data.get("file_result_view") == "表格" else "缩略图",
-        "folder_path": folder_path if isinstance(folder_path, str) else "",
-        "folder_history": normalize_folder_history(
-            raw_data.get("folder_history"),
-            folder_path if isinstance(folder_path, str) else "",
-        ),
-        "keyword": keyword if isinstance(keyword, str) else "",
-        "reference_config": load_reference_config(raw_data.get("reference_config")),
-        "disabled_sheet_marker": disabled_sheet_marker if isinstance(disabled_sheet_marker, str) else "",
-        "data_filter_config": load_data_filter_config(raw_data.get("data_filter_config")),
-        "help_url": help_url if isinstance(help_url, str) else "",
-        "background_image_path": background_image_path if isinstance(background_image_path, str) else "",
-        "only_enabled_sheets": bool(raw_data.get("only_enabled_sheets", False)),
-        "only_enabled_data": bool(raw_data.get("only_enabled_data", False)),
-        "only_specified_suffixes": bool(raw_data.get("only_specified_suffixes", False)),
-        "file_suffixes": file_suffixes if isinstance(file_suffixes, str) else "",
-        "search_folders": bool(raw_data.get("search_folders", False)),
-        "exact_match": bool(raw_data.get("exact_match", False)),
-    }
-
-
-def read_cache_file() -> dict[str, object]:
-    """读取原始 JSON 缓存文件，读取失败时返回空字典。"""
-
-    return read_shared_cache_data()
-
-
-def save_cache_data(cache_data: dict[str, object]) -> bool:
-    """保存缓存数据，同时保留工作表名称缓存等其他键。"""
-
-    reference_config = cache_data.get("reference_config", DEFAULT_REFERENCE_LOOKUP_CONFIG)
-    if not isinstance(reference_config, ReferenceLookupConfig):
-        reference_config = DEFAULT_REFERENCE_LOOKUP_CONFIG
-    data_filter_config = cache_data.get("data_filter_config", DEFAULT_DATA_FILTER_CONFIG)
-    if not isinstance(data_filter_config, DataFilterConfig):
-        data_filter_config = DEFAULT_DATA_FILTER_CONFIG
-
-    updates: dict[str, object] = {
-        "pinned_folders": normalize_folder_history(cache_data.get("pinned_folders"))[:10],
-        "preview_enabled": cache_data.get("preview_enabled", True) is not False,
-        "result_density": "紧凑" if cache_data.get("result_density") == "紧凑" else "舒适",
-        "file_result_view": "表格" if cache_data.get("file_result_view") == "表格" else "缩略图",
-        "folder_path": str(cache_data.get("folder_path", "")),
-        "folder_history": normalize_folder_history(cache_data.get("folder_history")),
-        "keyword": str(cache_data.get("keyword", "")),
-        "reference_config": reference_config_to_dict(reference_config),
-        "disabled_sheet_marker": str(cache_data.get("disabled_sheet_marker", DEFAULT_DISABLED_SHEET_MARKER)),
-        "data_filter_config": data_filter_config_to_dict(data_filter_config),
-        "help_url": str(cache_data.get("help_url", "")),
-        "background_image_path": str(cache_data.get("background_image_path", "")),
-        "only_enabled_sheets": bool(cache_data.get("only_enabled_sheets", False)),
-        "only_enabled_data": bool(cache_data.get("only_enabled_data", False)),
-        "only_specified_suffixes": bool(cache_data.get("only_specified_suffixes", False)),
-        "file_suffixes": str(cache_data.get("file_suffixes", "")),
-        "search_folders": bool(cache_data.get("search_folders", False)),
-        "exact_match": bool(cache_data.get("exact_match", False)),
-    }
-    worksheet_sheet_cache = cache_data.get(WORKSHEET_SHEET_CACHE_KEY)
-    if isinstance(worksheet_sheet_cache, dict):
-        updates[WORKSHEET_SHEET_CACHE_KEY] = worksheet_sheet_cache
-    return update_shared_cache_data(updates)
-
-
-def normalize_folder_history(raw_history: object, current_folder: str = "") -> list[str]:
-    """清理文件夹历史记录：去空、去重、保留最近使用项。"""
-
-    candidates: list[str] = []
-    if current_folder:
-        candidates.append(current_folder)
-    if isinstance(raw_history, list):
-        candidates.extend(item for item in raw_history if isinstance(item, str))
-
-    history: list[str] = []
-    seen_keys: set[str] = set()
-    for candidate in candidates:
-        folder_path = candidate.strip()
-        if not folder_path:
-            continue
-        folder_key = os.path.normcase(os.path.normpath(folder_path))
-        if folder_key in seen_keys:
-            continue
-        seen_keys.add(folder_key)
-        history.append(folder_path)
-        if len(history) >= FOLDER_HISTORY_LIMIT:
-            break
-    return history
-
-
-def load_reference_config(raw_config: object) -> ReferenceLookupConfig:
-    """从缓存恢复引用查找配置，非法时回到默认值。"""
-
-    if not isinstance(raw_config, dict):
-        return DEFAULT_REFERENCE_LOOKUP_CONFIG
-
-    try:
-        config = ReferenceLookupConfig(
-            sample_text=str(raw_config.get("sample_text", DEFAULT_REFERENCE_LOOKUP_CONFIG.sample_text)),
-            reference_row_index=parse_positive_int(
-                raw_config.get("reference_row_index", DEFAULT_REFERENCE_LOOKUP_CONFIG.reference_row_index),
-                "引用行",
-                EXCEL_MAX_ROWS,
-            ),
-            table_name=str(raw_config.get("table_name", DEFAULT_REFERENCE_LOOKUP_CONFIG.table_name)),
-            field_name=str(raw_config.get("field_name", DEFAULT_REFERENCE_LOOKUP_CONFIG.field_name)),
-            field_row_index=parse_positive_int(
-                raw_config.get("field_row_index", DEFAULT_REFERENCE_LOOKUP_CONFIG.field_row_index),
-                "引用字段行",
-                EXCEL_MAX_ROWS,
-            ),
-        )
-        validate_reference_lookup_config(config)
-    except ExcelReadError:
-        return DEFAULT_REFERENCE_LOOKUP_CONFIG
-    return config
-
-
-def load_data_filter_config(raw_config: object) -> DataFilterConfig:
-    """从缓存恢复启用数据过滤配置，并兼容旧版行过滤字段。"""
-
-    if not isinstance(raw_config, dict):
-        return DEFAULT_DATA_FILTER_CONFIG
-
-    try:
-        # 旧版本只有 row_filter_mode，这里把它迁移到禁用行/区间行两个独立开关。
-        old_row_filter_mode = str(raw_config.get("row_filter_mode", ""))
-        old_row_marker_column_index = raw_config.get(
-            "row_marker_column_index",
-            DEFAULT_DATA_FILTER_CONFIG.disabled_row_marker_column_index,
-        )
-        config = DataFilterConfig(
-            enable_header_filter=bool(raw_config.get("enable_header_filter", False)),
-            header_row_count=parse_positive_int(
-                raw_config.get(
-                    "header_row_count",
-                    DEFAULT_DATA_FILTER_CONFIG.header_row_count,
-                ),
-                "表头长度",
-                EXCEL_MAX_ROWS,
-            ),
-            enable_blank_header_column_filter=bool(
-                raw_config.get("enable_blank_header_column_filter", False)
-            ),
-            enable_column_filter=bool(raw_config.get("enable_column_filter", False)),
-            column_marker_row_index=parse_positive_int(
-                raw_config.get(
-                    "column_marker_row_index",
-                    DEFAULT_DATA_FILTER_CONFIG.column_marker_row_index,
-                ),
-                "列判断行",
-                EXCEL_MAX_ROWS,
-            ),
-            disabled_column_marker=str(
-                raw_config.get(
-                    "disabled_column_marker",
-                    DEFAULT_DATA_FILTER_CONFIG.disabled_column_marker,
-                )
-            ),
-            enable_disabled_row_filter=bool(
-                raw_config.get(
-                    "enable_disabled_row_filter",
-                    old_row_filter_mode == "禁用",
-                )
-            ),
-            disabled_row_marker_column_index=parse_positive_int(
-                raw_config.get(
-                    "disabled_row_marker_column_index",
-                    old_row_marker_column_index,
-                ),
-                "行禁用判断列",
-                EXCEL_MAX_COLUMNS,
-            ),
-            disabled_row_contains=str(raw_config.get("disabled_row_contains", "")),
-            enable_range_row_filter=bool(
-                raw_config.get(
-                    "enable_range_row_filter",
-                    old_row_filter_mode == "区间",
-                )
-            ),
-            range_row_marker_column_index=parse_positive_int(
-                raw_config.get(
-                    "range_row_marker_column_index",
-                    old_row_marker_column_index,
-                ),
-                "行区间判断列",
-                EXCEL_MAX_COLUMNS,
-            ),
-            range_start_text=str(raw_config.get("range_start_text", "")),
-            range_end_text=str(raw_config.get("range_end_text", "")),
-        )
-        validate_data_filter_config(config)
-    except ExcelReadError:
-        return DEFAULT_DATA_FILTER_CONFIG
-    return config
-
-
-def reference_config_to_dict(config: ReferenceLookupConfig) -> dict[str, object]:
-    """把引用配置转换成可写入 JSON 的字典。"""
-
-    return {
-        "sample_text": config.sample_text,
-        "reference_row_index": config.reference_row_index,
-        "table_name": config.table_name,
-        "field_name": config.field_name,
-        "field_row_index": config.field_row_index,
-    }
-
-
-def data_filter_config_to_dict(config: DataFilterConfig) -> dict[str, object]:
-    """把启用数据过滤配置转换成可写入 JSON 的字典。"""
-
-    return {
-        "enable_header_filter": config.enable_header_filter,
-        "header_row_count": config.header_row_count,
-        "enable_blank_header_column_filter": config.enable_blank_header_column_filter,
-        "enable_column_filter": config.enable_column_filter,
-        "column_marker_row_index": config.column_marker_row_index,
-        "disabled_column_marker": config.disabled_column_marker,
-        "enable_disabled_row_filter": config.enable_disabled_row_filter,
-        "disabled_row_marker_column_index": config.disabled_row_marker_column_index,
-        "disabled_row_contains": config.disabled_row_contains,
-        "enable_range_row_filter": config.enable_range_row_filter,
-        "range_row_marker_column_index": config.range_row_marker_column_index,
-        "range_start_text": config.range_start_text,
-        "range_end_text": config.range_end_text,
-    }
-
-
 def get_sheet_enabled_status(sheet_name: str, disabled_marker: str) -> str:
     """根据工作表名称前缀判断启用状态。"""
 
@@ -2916,18 +2656,6 @@ def get_sheet_enabled_status(sheet_name: str, disabled_marker: str) -> str:
         return ""
     marker = disabled_marker.strip()
     return "未启用" if marker and sheet_name.startswith(marker) else "启用"
-
-
-def normalize_help_url(help_url: str) -> str:
-    """补全帮助链接协议，方便用户只输入域名。"""
-
-    url = help_url.strip()
-    if not url:
-        return ""
-    known_schemes = ("http://", "https://", "file://", "mailto:")
-    if url.lower().startswith(known_schemes):
-        return url
-    return f"https://{url}"
 
 
 def format_cell_value(value: str) -> str:
@@ -2959,43 +2687,6 @@ def format_reference_label(reference: ExcelSheetReference) -> str:
     if reference.source_field_name:
         parts.append(f"本表字段：{reference.source_field_name}")
     return "，".join(parts)
-
-
-def open_containing_folder(file_path: Path) -> bool:
-    """在父目录中选中文件或子文件夹；返回是否确认定位成功。"""
-
-    return open_desktop_target(file_path, reveal=True).located
-
-
-def open_file(
-    file_path: Path,
-    sheet_name: str | None = None,
-    row_index: int | None = None,
-    column_index: int | None = None,
-) -> bool:
-    """打开目标并尝试前置；返回是否完成目标位置的确认。"""
-
-    return open_desktop_target(file_path, sheet_name, row_index, column_index).located
-
-
-def open_excel_sheet(
-    file_path: Path,
-    sheet_name: str,
-    row_index: int | None = None,
-    column_index: int | None = None,
-) -> None:
-    """保留旧入口，打开指定工作表或单元格并尝试前置目标窗口。"""
-
-    from desktop_open import open_excel
-    result = open_excel(file_path, sheet_name, row_index, column_index)
-    if not result.located:
-        raise OSError(result.message or "Excel 已打开，但未能定位到指定工作表或单元格")
-
-
-def powershell_quote(value: str) -> str:
-    """把 Python 字符串安全转成 PowerShell 单引号字符串。"""
-
-    return "'" + value.replace("'", "''") + "'"
 
 
 def set_windows_app_user_model_id() -> None:
