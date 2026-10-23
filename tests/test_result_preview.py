@@ -151,7 +151,7 @@ class PreviewPaneTests(unittest.TestCase):
             cls.root.destroy()
 
     def setUp(self) -> None:
-        self.pane = ResultPreviewPane(self.root, lambda: None, lambda: None, lambda: None)
+        self.pane = ResultPreviewPane(self.root, lambda: None)
 
     def tearDown(self) -> None:
         self.pane.destroy()
@@ -179,6 +179,7 @@ class PreviewPaneTests(unittest.TestCase):
         self.assertEqual(calls[0][0], Path("new.xlsx"))
         self.assertNotEqual(calls[0][1], main_thread)
         self.assertEqual(self.pane.content_box.get("1.0", "end-1c"), "last")
+        self.assertEqual(self.pane.copy_path_button.cget("state"), "normal")
         self.assertEqual(self.pane.nearby_tree.item(self.pane.nearby_tree.get_children()[0], "text"), "20")
 
     def test_switch_during_read_discards_old_result_and_clear_discards_pending_result(self) -> None:
@@ -203,7 +204,7 @@ class PreviewPaneTests(unittest.TestCase):
             self.pane._responses.put_nowait((old_generation, "file", FilePreviewData(False, 999, "STALE")))
             self.pump_until(self.pane._responses.empty)
         self.assertIsNone(self.pane._selection_key)
-        self.assertEqual(self.pane.open_button.cget("state"), "disabled")
+        self.assertEqual(self.pane.copy_path_button.cget("state"), "disabled")
         self.assertNotIn("STALE", self.pane.file_metadata_label.cget("text"))
 
 

@@ -215,10 +215,7 @@ def _set_label_image(label: ctk.CTkLabel, image: ctk.CTkImage | None, text: str)
 class ResultPreviewPane(ctk.CTkFrame):
     """当前选中结果的检查器。I/O、Excel 解析与图像解码均在单个后台线程执行。"""
 
-    def __init__(
-        self, parent: object, on_open: Callable[[], None],
-        on_directory: Callable[[], None], on_copy_path: Callable[[], None],
-    ) -> None:
+    def __init__(self, parent: object, on_copy_path: Callable[[], None]) -> None:
         super().__init__(parent, width=350, fg_color=theme.SURFACE, corner_radius=9, border_width=1, border_color=theme.BORDER)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -302,14 +299,7 @@ class ResultPreviewPane(ctk.CTkFrame):
         self.path_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         self.path_box.configure(state="disabled")
 
-        footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=3, column=0, sticky="ew", padx=18, pady=(10, 4))
-        footer.grid_columnconfigure(0, weight=1)
-        self.open_button = ctk.CTkButton(footer, text="打开所选结果", height=35, fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, text_color=theme.ON_ACCENT, font=("Microsoft YaHei UI", 12, "bold"), command=on_open)
-        self.open_button.grid(row=0, column=0, sticky="ew", padx=(0, 7))
-        self.directory_button = ctk.CTkButton(footer, text="目录", width=64, height=35, fg_color=theme.SURFACE, border_width=1, border_color=theme.BORDER, hover_color=theme.HOVER_BG, text_color=theme.TEXT, font=("Microsoft YaHei UI", 11), command=on_directory)
-        self.directory_button.grid(row=0, column=1)
-        ctk.CTkLabel(self, text="单击预览 · 双击打开 · Ctrl+C 复制内容", font=("Microsoft YaHei UI", 10), text_color=theme.SUBTLE, anchor="w").grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 9))
+        ctk.CTkLabel(self, text="文件操作位于结果列表下方", font=("Microsoft YaHei UI", 10), text_color=theme.SUBTLE, anchor="w").grid(row=3, column=0, sticky="ew", padx=18, pady=(5, 9))
         self.bind("<Configure>", self._on_resize, add="+")
         self.clear()
         self._worker_thread = Thread(target=self._worker, name="result-preview", daemon=True)
@@ -345,8 +335,6 @@ class ResultPreviewPane(ctk.CTkFrame):
         self.nearby_tree.delete(*self.nearby_tree.get_children())
         self.nearby_label.configure(text="相关数据")
         self.cell_status_label.configure(text="正在读取附近数据…")
-        self.open_button.configure(text="在 Excel 中定位", state="normal")
-        self.directory_button.configure(state="normal")
         self.copy_path_button.configure(state="normal")
         self._schedule("cell", (path, sheet_name, row_index, column_index))
 
@@ -365,8 +353,6 @@ class ResultPreviewPane(ctk.CTkFrame):
         self.file_name_label.configure(text=path.name or str(path))
         self.file_metadata_label.configure(text="正在读取文件信息…")
         self._set_text(self.path_box, str(path))
-        self.open_button.configure(text="打开文件", state="normal")
-        self.directory_button.configure(state="normal")
         self.copy_path_button.configure(state="normal")
         self._schedule("file", (path,))
 
@@ -488,7 +474,6 @@ class ResultPreviewPane(ctk.CTkFrame):
         else:
             text = data.image_error or ("▱\n文件夹" if data.is_directory else f"{suffix or 'FILE'}\n使用默认程序打开此文件")
             self._set_file_image(None, text)
-        self.open_button.configure(text="打开文件夹" if data.is_directory else "打开文件")
 
     def _set_file_image(self, image: ctk.CTkImage | None, text: str) -> None:
         _set_label_image(self.file_image_label, image, text)
@@ -543,8 +528,6 @@ class ResultPreviewPane(ctk.CTkFrame):
         self.file_frame.grid_remove()
         self.path_frame.grid_remove()
         self.empty_label.grid(row=0, column=0, sticky="ew", pady=20)
-        self.open_button.configure(text="打开所选结果", state="disabled")
-        self.directory_button.configure(state="disabled")
         self.copy_path_button.configure(state="disabled")
 
     def destroy(self) -> None:

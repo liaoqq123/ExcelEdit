@@ -145,7 +145,10 @@ def build_main_layout(app):
     app.result_tree.bind("<ButtonRelease-1>", app._handle_result_click)
     app.result_tree.bind("<Double-1>", app._handle_result_double_click)
     app.result_tree.bind("<<TreeviewSelect>>", app._on_result_selected)
-    app.result_tree.bind("<Return>", lambda _event: app.open_selected_item())
+    def open_result_on_enter(_event):
+        app.open_selected_item()
+        return "break"
+    app.result_tree.bind("<Return>", open_result_on_enter)
     app.result_tree.bind("<Control-c>", lambda _event: app._copy_selected())
     app.result_tree.bind("<Button-3>", app._show_result_menu)
     app.result_tree.bind("<Configure>", lambda _event: app._schedule_action_button_layout())
@@ -171,10 +174,13 @@ def build_main_layout(app):
     app.selection_label = ctk.CTkLabel(selected, text="选择结果可查看详情", text_color=ui.MUTED, anchor="w", font=("Microsoft YaHei UI", 11))
     app.selection_label.grid(row=0, column=0, padx=16, pady=4, sticky="ew")
     quiet(selected, "复制内容", app._copy_selected, 84).grid(row=0, column=1, padx=(4, 8))
-    app.selection_open_button = quiet(selected, "打开 / 定位", app._open_selected_target, 104)
-    app.selection_open_button.grid(row=0, column=2, padx=(0, 12))
-    app.preview_pane = ResultPreviewPane(body, on_open=app._open_selected_target, on_directory=app._open_selected_directory,
-                                        on_copy_path=lambda: app._copy_selected("path"))
+    app.selection_directory_button = quiet(selected, "打开所在目录", app._open_selected_directory, 112)
+    app.selection_directory_button.grid(row=0, column=2, padx=(0, 8))
+    app.selection_open_button = ctk.CTkButton(selected, text="打开", command=app._open_selected_target,
+        width=132, height=30, corner_radius=6, fg_color=ui.ACCENT, hover_color=ui.ACCENT_HOVER, text_color=ui.ON_ACCENT)
+    app.selection_open_button.grid(row=0, column=3, padx=(0, 12))
+    app._sync_result_actions()
+    app.preview_pane = ResultPreviewPane(body, on_copy_path=lambda: app._copy_selected("path"))
     app.preview_pane.configure(width=330)
     app.preview_pane.grid(row=0, column=1, padx=(14, 0), sticky="nsew")
     app.preview_pane.grid_propagate(False)

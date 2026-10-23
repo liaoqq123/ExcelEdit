@@ -32,7 +32,8 @@ from cell_search import (
     search_excel_cells,
     validate_data_filter_config,
 )
-from excel_common import EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError
+from excel_common import EXCEL_EXTENSIONS, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, ExcelReadError
+from desktop_open import OpenResult, open_target as open_desktop_target
 from file_result_view import FileResultView
 from result_preview import ResultPreviewPane
 from search_status import SearchSnapshot, SearchTracker
@@ -90,7 +91,6 @@ WORKSHEET_RESULT_COLUMNS = (
 )
 CELL_RESULT_COLUMNS = (
     ("value", "命中内容", 500, 180, True),
-    ("action", "操作", 110, 100, False),
 )
 FILE_TABLE_RESULT_COLUMNS = (
     ("file_name", "文件/文件夹名", 320, 180, True),
@@ -120,6 +120,20 @@ class ResultTarget:
     row_index: int | None = None
     column_index: int | None = None
     open_containing_folder: bool = False
+    is_directory: bool = False
+
+
+def get_open_action_label(target: ResultTarget | None) -> str:
+    """按钮与菜单共用同一命名规则，选中变化时不读取磁盘。"""
+    if target is None:
+        return "打开"
+    if target.is_directory:
+        return "进入文件夹"
+    if target.sheet_name:
+        return "在 Excel 中定位"
+    if target.file_path.suffix.lower() in EXCEL_EXTENSIONS:
+        return "打开 Excel"
+    return "打开文件"
 
 
 class ExcelEditApp(ctk.CTk):
@@ -139,10 +153,8 @@ class ExcelEditApp(ctk.CTk):
         self.reference_items_by_source: dict[str, list[str]] = {}
         self.reference_searching_items: set[str] = set()
         self.action_buttons: dict[str, ctk.CTkButton] = {}
-        self.directory_buttons: dict[str, ctk.CTkButton] = {}
         self.action_layout_job: str | None = None
         self.action_item_ids: set[str] = set()
-        self.directory_item_ids: set[str] = set()
         self.tree_render_job: str | None = None
         self.tree_render_serial = 0
         self.search_tracker: SearchTracker | None = None
@@ -582,30 +594,6 @@ class ExcelEditApp(ctk.CTk):
         )
         self.action_buttons[item_id] = button
 
-    def _create_directory_button(self, item_id: str) -> None:
-        """为单元格检索中的工作簿目录行创建“打开目录”按钮。"""
-
-        button = ctk.CTkButton(
-            self.result_tree,
-            text="打开目录",
-            width=96,
-            height=24,
-            corner_radius=5,
-            fg_color=ui.TEXT,
-            hover_color=ui.TEXT,
-            text_color=ui.ON_ACCENT,
-            command=lambda item=item_id: self._open_directory_for_item(item),
-        )
-        self.directory_buttons[item_id] = button
-
-    def _open_directory_for_item(self, item_id: str) -> None:
-        """在资源管理器中打开工作簿所在目录并选中文件。"""
-
-        target = self.item_targets.get(item_id)
-        if target is None:
-            return
-        self._open_target(ResultTarget(target.file_path, open_containing_folder=True))
-
     def _click_reference_button(self, item_id: str) -> None:
         """点击查找引用按钮时同步选中行并启动引用查找。"""
 
@@ -723,44 +711,36 @@ class ExcelEditApp(ctk.CTk):
         self.action_layout_job = self.after_idle(self._layout_action_buttons)
 
     def _layout_action_buttons(self) -> None:
-        """只为可见行分配操作按钮，滚动时复用离开视口的按钮。"""
-
+        """工作表的查找引用按钮只在可见行分配；打开操作集中在底部。"""
         self.action_layout_job = None
         visible = set(self._get_visible_result_item_ids()) if "action" in self.current_result_columns else set()
-        for buttons, eligible, create, reference in (
-            (self.action_buttons, self.action_item_ids, self._create_action_button, True),
-            (self.directory_buttons, self.directory_item_ids, self._create_directory_button, False),
-        ):
-            spare = []
-            for item_id in list(buttons):
-                if item_id not in visible:
-                    button = buttons.pop(item_id)
-                    button.place_forget()
-                    spare.append(button)
-            for item_id in visible & eligible:
-                bbox = self.result_tree.bbox(item_id, "action")
-                if not bbox:
-                    continue
-                if item_id not in buttons:
-                    if spare:
-                        buttons[item_id] = spare.pop()
-                    else:
-                        create(item_id)
-                button = buttons[item_id]
-                searching = reference and item_id in self.reference_searching_items
-                button.configure(
-                    text="查找中..." if searching else "查找引用" if reference else "打开目录",
-                    state="disabled" if searching else "normal",
-                    command=(lambda item=item_id: self._click_reference_button(item)) if reference
-                            else (lambda item=item_id: self._open_directory_for_item(item)),
-                )
-                x, y, width, height = bbox
-                button_width = min(104, max(86, width - 12))
-                button_height = min(24, max(20, height - 6))
-                button.configure(width=button_width, height=button_height)
-                button.place(x=x + max(4, (width - button_width) // 2), y=y + max(3, (height - button_height) // 2))
-            for button in spare:
-                button.destroy()
+        spare = []
+        for item_id in list(self.action_buttons):
+            if item_id not in visible:
+                button = self.action_buttons.pop(item_id)
+                button.place_forget()
+                spare.append(button)
+        for item_id in visible & self.action_item_ids:
+            bbox = self.result_tree.bbox(item_id, "action")
+            if not bbox:
+                continue
+            if item_id not in self.action_buttons:
+                if spare:
+                    self.action_buttons[item_id] = spare.pop()
+                else:
+                    self._create_action_button(item_id)
+            button = self.action_buttons[item_id]
+            searching = item_id in self.reference_searching_items
+            button.configure(text="查找中..." if searching else "查找引用",
+                             state="disabled" if searching else "normal",
+                             command=lambda item=item_id: self._click_reference_button(item))
+            x, y, width, height = bbox
+            button_width = min(104, max(86, width - 12))
+            button_height = min(24, max(20, height - 6))
+            button.configure(width=button_width, height=button_height)
+            button.place(x=x + max(4, (width - button_width) // 2), y=y + max(3, (height - button_height) // 2))
+        for button in spare:
+            button.destroy()
 
     def _refresh_filter_chips(self) -> None:
         from main_layout import MODES
@@ -871,6 +851,7 @@ class ExcelEditApp(ctk.CTk):
             self.selected_target = None
             self.selected_value = ""
             self.selection_label.configure(text="选择结果可查看详情")
+            self._sync_result_actions()
             self.preview_pane.clear()
             return
         item = selection[0]
@@ -881,14 +862,14 @@ class ExcelEditApp(ctk.CTk):
         self.selected_value = self.item_raw_values.get(item, "\t".join(str(v) for v in self.result_tree.item(item, "values") if v))
         self.selection_label.configure(text=(f"已选择 {format_excel_cell_address(target.row_index, target.column_index)} · {target.sheet_name}"
                                              if target.row_index and target.column_index else f"已选择：{target.sheet_name or target.file_path.name}"))
-        self.selection_open_button.configure(text="在 Excel 中定位" if target.sheet_name else "打开文件")
+        self._sync_result_actions()
         self._update_selected_preview()
 
     def _on_file_selected(self, result: FileSearchResult) -> None:
-        self.selected_target = ResultTarget(result.path)
+        self.selected_target = ResultTarget(result.path, is_directory=result.is_directory)
         self.selected_value = result.file_name
         self.selection_label.configure(text=f"已选择：{result.file_name}")
-        self.selection_open_button.configure(text="打开文件夹" if result.is_directory else "打开文件")
+        self._sync_result_actions()
         self._update_selected_preview()
 
     def _update_selected_preview(self) -> None:
@@ -902,7 +883,26 @@ class ExcelEditApp(ctk.CTk):
             self.preview_pane.show_file(target.file_path)
 
     def _open_file_result(self, result: FileSearchResult) -> None:
-        self._open_target(ResultTarget(result.path))
+        target = ResultTarget(result.path, is_directory=result.is_directory)
+        if self.selected_target != target:
+            self._on_file_selected(result)
+        self._open_target(target)
+
+    def _sync_result_actions(self) -> None:
+        """固定操作栏只反映当前选择，进行中的相同操作不能重复点击。"""
+        target = self.selected_target
+        if target is None:
+            self.selection_open_button.configure(text="打开", state="disabled")
+            self.selection_directory_button.configure(text="打开所在目录", state="disabled")
+            return
+        primary = replace(target, file_path=Path(os.path.abspath(os.fspath(target.file_path))))
+        directory = ResultTarget(primary.file_path, open_containing_folder=True)
+        opening = primary in self.opening_targets
+        revealing = directory in self.opening_targets
+        self.selection_open_button.configure(text="打开中…" if opening else get_open_action_label(target),
+                                             state="disabled" if opening else "normal")
+        self.selection_directory_button.configure(text="定位中…" if revealing else "打开所在目录",
+                                                  state="disabled" if revealing else "normal")
 
     def _open_selected_target(self) -> None:
         if self.selected_target:
@@ -953,7 +953,7 @@ class ExcelEditApp(ctk.CTk):
             menu.add_command(label="复制单元格地址", command=lambda: self._copy_selected("address"))
         menu.add_command(label="复制文件路径", command=lambda: self._copy_selected("path"))
         menu.add_separator()
-        menu.add_command(label="在 Excel 中定位" if target.sheet_name else "打开文件", accelerator="Enter", command=self._open_selected_target)
+        menu.add_command(label=get_open_action_label(target), accelerator="Enter", command=self._open_selected_target)
         menu.add_command(label="打开所在目录", command=self._open_selected_directory)
         if target.sheet_name:
             menu.add_separator()
@@ -1840,12 +1840,11 @@ class ExcelEditApp(ctk.CTk):
                     "",
                     "end",
                     text=workbook_path.name,
-                    values=(f"{len(workbook_matches)} 条匹配", ""),
+                    values=(f"{len(workbook_matches)} 条匹配",),
                     open=True,
                     tags=("cell-workbook",),
                 )
                 self.item_targets[workbook_item_id] = ResultTarget(workbook_path)
-                self.directory_item_ids.add(workbook_item_id)
 
                 matches_by_sheet: dict[str, list[ExcelCellMatch]] = {}
                 for match in workbook_matches:
@@ -1856,7 +1855,7 @@ class ExcelEditApp(ctk.CTk):
                         workbook_item_id,
                         "end",
                         text=sheet_name,
-                        values=(f"{len(sheet_matches)} 条匹配", ""),
+                        values=(f"{len(sheet_matches)} 条匹配",),
                         open=True,
                         tags=("cell-sheet",),
                     )
@@ -1867,10 +1866,7 @@ class ExcelEditApp(ctk.CTk):
                             sheet_item_id,
                             "end",
                             text=format_excel_cell_address(match.row_index, match.column_index),
-                            values=(
-                                format_cell_value(match.value),
-                                "",
-                            ),
+                            values=(format_cell_value(match.value),),
                         )
                         self.item_targets[item_id] = ResultTarget(
                             match.path,
@@ -1970,6 +1966,7 @@ class ExcelEditApp(ctk.CTk):
         self.selected_target = None
         self.selected_value = ""
         self.selection_label.configure(text="选择结果可查看详情")
+        self._sync_result_actions()
         self.preview_pane.clear()
         items = self.result_tree.get_children()
         if items:
@@ -2003,7 +2000,7 @@ class ExcelEditApp(ctk.CTk):
                     values=("", "", f"{len(folder_results)} 项"),
                     open=True,
                 )
-                self.item_targets[folder_item_id] = ResultTarget(folder_path)
+                self.item_targets[folder_item_id] = ResultTarget(folder_path, is_directory=True)
                 for result in folder_results:
                     item_type = self._get_file_thumbnail_style(result)[2]
                     item_id = self.result_tree.insert(
@@ -2012,9 +2009,7 @@ class ExcelEditApp(ctk.CTk):
                         text="",
                         values=(result.file_name, item_type, str(result.path)),
                     )
-                    self.item_targets[item_id] = ResultTarget(
-                        result.path,
-                    )
+                    self.item_targets[item_id] = ResultTarget(result.path, is_directory=result.is_directory)
                     self.item_raw_values[item_id] = result.file_name
                     yield
 
@@ -2091,20 +2086,11 @@ class ExcelEditApp(ctk.CTk):
             pending_items.extend(child_items)
         self.result_group_controls.grid_remove()
 
-    def _toggle_tree_item(self, item_id: str) -> None:
-        """展开或收起有子节点的结果行。"""
-
-        if self.result_tree.get_children(item_id):
-            self.result_tree.item(item_id, open=not bool(self.result_tree.item(item_id, "open")))
-
-    def _open_or_toggle_selected_item(self, item_id: str) -> None:
-        """双击父节点时展开/收起，双击具体目标时打开。"""
+    def _open_result_item(self, item_id: str) -> None:
+        """双击和 Enter 与底部主按钮一致；分组使用展开箭头控制。"""
 
         target = self.item_targets.get(item_id)
         if target is None:
-            return
-        if target.sheet_name is None and self.result_tree.get_children(item_id):
-            self._toggle_tree_item(item_id)
             return
         self._open_item(item_id)
 
@@ -2121,9 +2107,11 @@ class ExcelEditApp(ctk.CTk):
     def _open_target(self, target: ResultTarget) -> None:
         """异步打开一个已确定的目标，供表格行和缩略图卡片共用。"""
 
+        target = replace(target, file_path=Path(os.path.abspath(os.fspath(target.file_path))))
         if target in self.opening_targets:
             return
         self.opening_targets.add(target)
+        self._sync_result_actions()
         self.status_label.configure(text=f"正在打开：{target.file_path.name}")
         worker = Thread(target=self._open_target_in_background, args=(target,), daemon=True)
         worker.start()
@@ -2132,11 +2120,10 @@ class ExcelEditApp(ctk.CTk):
         """在后台打开目标，避免 Excel COM 或系统关联程序阻塞 Tk 主线程。"""
 
         try:
-            if target.open_containing_folder:
-                open_containing_folder(target.file_path)
-                located = True
-            else:
-                located = open_file(target.file_path, target.sheet_name, target.row_index, target.column_index)
+            result = open_desktop_target(
+                target.file_path, target.sheet_name, target.row_index, target.column_index,
+                reveal=target.open_containing_folder,
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             message = str(exc)
             self._post_to_ui(
@@ -2150,21 +2137,31 @@ class ExcelEditApp(ctk.CTk):
             )
             return
 
-        self._post_to_ui(lambda target=target, located=located: self._open_target_finished(target, located))
+        self._post_to_ui(lambda target=target, result=result: self._open_target_finished(target, result))
 
-    def _open_target_finished(self, target: ResultTarget, located: bool) -> None:
+    def _open_target_finished(self, target: ResultTarget, result: OpenResult) -> None:
         """目标打开完成后更新状态。"""
 
         self.opening_targets.discard(target)
-        if target.sheet_name and not located:
-            self.status_label.configure(text="文件已打开，但未能自动定位到指定工作表或单元格")
+        self._sync_result_actions()
+        if not result.hwnd:
+            text = f"已提交打开请求，未确认目标窗口：{target.file_path.name}"
+        elif result.foreground:
+            action = "定位" if result.located and (target.open_containing_folder or target.sheet_name) else "打开"
+            text = f"已{action}并切到前台：{target.file_path.name}"
         else:
-            self.status_label.configure(text=f"已打开：{target.file_path.name}")
+            text = f"已打开：{target.file_path.name}；窗口当前未在前台"
+        if result.hwnd and not result.located:
+            text += "；未能完成目标定位"
+        if result.message:
+            text += f"；{result.message}"
+        self.status_label.configure(text=text)
 
     def _open_target_failed(self, target: ResultTarget, message: str) -> None:
         """显示后台打开文件失败信息。"""
 
         self.opening_targets.discard(target)
+        self._sync_result_actions()
         self.status_label.configure(text="打开失败")
         messagebox.showerror("打开失败", f"无法打开文件：{target.file_path}\n{message}")
 
@@ -2177,6 +2174,7 @@ class ExcelEditApp(ctk.CTk):
             self.local_filter_job = None
         self.selected_target = None
         self.selected_value = ""
+        self._sync_result_actions()
         self.preview_pane.clear()
         self.selection_label.configure(text="选择结果可查看详情")
         self.item_raw_values.clear()
@@ -2191,7 +2189,6 @@ class ExcelEditApp(ctk.CTk):
             self.result_count_label.configure(text="检索结果  0")
             self.result_summary_label.configure(text="等待检索结果…" if self.search_cancel_event else "选择目录，输入关键词即可开始")
         self.action_item_ids.clear()
-        self.directory_item_ids.clear()
         self.result_group_controls.grid_remove()
         self._hide_result_grid_lines()
         self.file_thumbnail_results.clear()
@@ -2206,9 +2203,6 @@ class ExcelEditApp(ctk.CTk):
         for button in self.action_buttons.values():
             button.destroy()
         self.action_buttons.clear()
-        for button in self.directory_buttons.values():
-            button.destroy()
-        self.directory_buttons.clear()
         items = self.result_tree.get_children()
         if items:
             self.result_tree.delete(*items)
@@ -2235,7 +2229,7 @@ class ExcelEditApp(ctk.CTk):
         self._render_tree_rows(rows())
 
     def _handle_result_click(self, event: object) -> str | None:
-        """处理单击事件，按行类型执行引用查找或打开目录。"""
+        """工作表操作列只执行引用查找，文件打开使用统一操作栏。"""
 
         column_key = self._get_column_key(self.result_tree.identify_column(event.x))
         if column_key != "action":
@@ -2243,11 +2237,6 @@ class ExcelEditApp(ctk.CTk):
 
         item_id = self.result_tree.identify_row(event.y)
         if not item_id:
-            return "break"
-        if item_id in self.directory_item_ids:
-            self.result_tree.selection_set(item_id)
-            self.result_tree.focus(item_id)
-            self._open_directory_for_item(item_id)
             return "break"
         if not self._action_button_is_available(item_id):
             return "break"
@@ -2260,23 +2249,22 @@ class ExcelEditApp(ctk.CTk):
     def _handle_result_double_click(self, event: object) -> str:
         """处理双击事件，默认打开对应目标。"""
 
+        if self.result_tree.identify_element(event.x, event.y) == "Treeitem.indicator":
+            return "break"
         column_key = self._get_column_key(self.result_tree.identify_column(event.x))
         if column_key == "action":
             item_id = self.result_tree.identify_row(event.y)
             if item_id:
                 self.result_tree.selection_set(item_id)
                 self.result_tree.focus(item_id)
-                if item_id in self.directory_item_ids:
-                    self._open_directory_for_item(item_id)
-                else:
-                    self._find_references_for_item(item_id)
+                self._find_references_for_item(item_id)
             return "break"
 
         item_id = self.result_tree.identify_row(event.y)
         if item_id:
             self.result_tree.selection_set(item_id)
             self.result_tree.focus(item_id)
-            self._open_or_toggle_selected_item(item_id)
+            self._open_result_item(item_id)
         return "break"
 
     def _find_references_for_item(self, item_id: str) -> None:
@@ -2555,13 +2543,13 @@ class ExcelEditApp(ctk.CTk):
         ]
 
     def open_selected_item(self) -> None:
-        """保留给快捷入口调用；当前界面主要通过双击打开结果。"""
+        """Enter 与底部主按钮打开相同的目标。"""
 
         selected_items = self.result_tree.selection()
         if not selected_items:
             messagebox.showinfo("未选择", "请先在列表中选择一个工作簿或工作表。")
             return
-        self._open_or_toggle_selected_item(selected_items[0])
+        self._open_result_item(selected_items[0])
 
     def _load_cached_inputs(self) -> None:
         """启动时读取上次文件夹、关键词、历史地址和设置。"""
@@ -2974,24 +2962,9 @@ def format_reference_label(reference: ExcelSheetReference) -> str:
 
 
 def open_containing_folder(file_path: Path) -> bool:
-    """打开文件所在目录；Windows 下尽量选中文件本身。"""
+    """在父目录中选中文件或子文件夹；返回是否确认定位成功。"""
 
-    if file_path.is_dir():
-        folder_path = file_path
-    else:
-        folder_path = file_path.parent
-
-    if sys.platform.startswith("win"):
-        if file_path.exists() and file_path.is_file():
-            subprocess.Popen(["explorer", f"/select,{file_path}"])
-            return True
-        os.startfile(str(folder_path))
-        return True
-    if sys.platform == "darwin":
-        subprocess.Popen(["open", str(folder_path)])
-        return False
-    subprocess.Popen(["xdg-open", str(folder_path)])
-    return False
+    return open_desktop_target(file_path, reveal=True).located
 
 
 def open_file(
@@ -3000,24 +2973,9 @@ def open_file(
     row_index: int | None = None,
     column_index: int | None = None,
 ) -> bool:
-    """打开文件；Windows 下可进一步定位到指定工作表和单元格。"""
+    """打开目标并尝试前置；返回是否完成目标位置的确认。"""
 
-    if sys.platform.startswith("win"):
-        if sheet_name:
-            try:
-                open_excel_sheet(file_path, sheet_name, row_index, column_index)
-                return True
-            except (OSError, subprocess.SubprocessError):
-                os.startfile(str(file_path))
-                return False
-
-        os.startfile(str(file_path))
-        return True
-    if sys.platform == "darwin":
-        subprocess.Popen(["open", str(file_path)])
-        return False
-    subprocess.Popen(["xdg-open", str(file_path)])
-    return False
+    return open_desktop_target(file_path, sheet_name, row_index, column_index).located
 
 
 def open_excel_sheet(
@@ -3026,64 +2984,12 @@ def open_excel_sheet(
     row_index: int | None = None,
     column_index: int | None = None,
 ) -> None:
-    """通过 Excel COM 打开指定工作表，并在需要时选中指定单元格。"""
+    """保留旧入口，打开指定工作表或单元格并尝试前置目标窗口。"""
 
-    file_arg = powershell_quote(str(file_path))
-    sheet_arg = powershell_quote(sheet_name)
-    row_arg = row_index if row_index is not None else "$null"
-    column_arg = column_index if column_index is not None else "$null"
-    script = f"""
-$ErrorActionPreference = 'Stop'
-$filePath = {file_arg}
-$sheetName = {sheet_arg}
-$rowIndex = {row_arg}
-$columnIndex = {column_arg}
-$excel = $null
-
-try {{
-    # 优先复用已经打开的 Excel 进程，避免重复启动多个 Excel 窗口。
-    $excel = [Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')
-}} catch {{
-    $excel = New-Object -ComObject Excel.Application
-}}
-
-$excel.Visible = $true
-$workbook = $null
-
-foreach ($book in @($excel.Workbooks)) {{
-    # 如果目标工作簿已经打开，直接复用它，避免打开第二份同名文件。
-    if ([string]::Equals($book.FullName, $filePath, [System.StringComparison]::OrdinalIgnoreCase)) {{
-        $workbook = $book
-        break
-    }}
-}}
-
-if ($null -eq $workbook) {{
-    $workbook = $excel.Workbooks.Open($filePath)
-}}
-
-$worksheet = $workbook.Worksheets.Item($sheetName)
-$workbook.Activate()
-$worksheet.Activate()
-
-if ($null -ne $rowIndex -and $null -ne $columnIndex) {{
-    # 单元格检索结果双击打开时，把命中单元格选中并滚动到附近。
-    $cell = $worksheet.Cells.Item($rowIndex, $columnIndex)
-    $cell.Select()
-    $excel.ActiveWindow.ScrollRow = [Math]::Max(1, $rowIndex - 5)
-    $excel.ActiveWindow.ScrollColumn = [Math]::Max(1, $columnIndex - 3)
-}}
-
-$excel.WindowState = -4137
-"""
-    subprocess.run(
-        ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        timeout=EXCEL_OPEN_TIMEOUT_SECONDS,
-    )
+    from desktop_open import open_excel
+    result = open_excel(file_path, sheet_name, row_index, column_index)
+    if not result.located:
+        raise OSError(result.message or "Excel 已打开，但未能定位到指定工作表或单元格")
 
 
 def powershell_quote(value: str) -> str:
